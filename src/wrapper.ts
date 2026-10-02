@@ -265,7 +265,12 @@ async function main(): Promise<void> {
   let searchDescription = TOOL_DESCRIPTIONS.search;
   if (configResult) {
     const start = performance.now();
-    const result = prewarm(configResult.config, storageRoot, projectDir);
+    const result = prewarm(
+      configResult.config,
+      storageRoot,
+      projectDir,
+      configResult.sourceBase,
+    );
     const elapsed = (performance.now() - start).toFixed(0);
     process.stderr.write(
       `[context-wrapper] Pre-warmed ${result.totalChunks} chunks from ` +

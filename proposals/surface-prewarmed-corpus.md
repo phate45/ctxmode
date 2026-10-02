@@ -52,6 +52,8 @@ dynamic from data already computed before the tool list is built.
 
 ## Related: CWD vs config-relative path resolution
 
+Superseded: a discovered config's relative source paths now resolve against the directory holding its `.claude/` (`FoundConfig.sourceBase`), and a config named by `CONTEXT_WRAPPER_CONFIG` against the launch CWD. The note below records the earlier behavior.
+
 Worth recording because it bites worktree setups. Source paths resolve against
 the wrapper's **`process.cwd()`** (and each source's own `path`), **not** the
 config file's directory — `findConfig` (`prewarm.ts:63-81`) uses `configPath`

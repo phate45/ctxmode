@@ -22,6 +22,8 @@ If you already have a `context-mode` entry in your `.mcp.json`, replace it — t
 
 Create `.claude/context-mode.json` in any project that should have pre-warmed content. To point at a config file outside the project tree, set `CONTEXT_WRAPPER_CONFIG` to its absolute path — the wrapper loads it verbatim and skips the upward `.claude/context-mode.json` search.
 
+A relative source `path` resolves against the project the config belongs to: the directory holding `.claude/` for a discovered config, so every subdirectory launch indexes the same files, and the launch CWD for a config named by `CONTEXT_WRAPPER_CONFIG`. An exec or paths source that omits `path` uses that same directory.
+
 Each source needs a `label` and a file selection strategy. Three strategies are available:
 
 ### Strategy 1: Glob (flat or recursive)
@@ -52,7 +54,7 @@ Add `"recursive": true` to scan subdirectories:
 
 ### Strategy 2: Exec
 
-Run a command that outputs a JSON array of file paths. Relative paths resolve from `path` (or CWD if omitted).
+Run a command that outputs a JSON array of file paths. The command runs in `path`, and relative output paths resolve from it.
 
 ```json
 {
@@ -73,7 +75,7 @@ Timeout: 10 seconds.
 
 ### Strategy 3: Explicit Paths
 
-Hardcode a list of file paths. Relative paths resolve from `path` (or CWD if omitted).
+Hardcode a list of file paths. Relative paths resolve from `path`.
 
 ```json
 {
@@ -92,7 +94,7 @@ Hardcode a list of file paths. Relative paths resolve from `path` (or CWD if omi
 |-------|-------------|
 | `label` | **(required)** Source tag for scoped search (`source: "work-logs"`) |
 | `description` | Short annotation of what the source is. Folded into the `search` tool description so the agent sees the pre-warmed corpus without a blind probe. |
-| `path` | Base directory. Required for glob, optional for exec/paths (used as CWD / base for relative paths) |
+| `path` | Base directory, absolute or relative to the config's project (see above). Required for glob, optional for exec/paths (used as CWD / base for relative paths) |
 | `glob` | File pattern to match (e.g. `*.md`). Requires `path`. |
 | `recursive` | Walk subdirectories when using glob. Default: `false` |
 | `exec` | Shell command that outputs a JSON array of file paths |

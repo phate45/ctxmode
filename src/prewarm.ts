@@ -67,9 +67,19 @@ export interface IndexPathOptions {
 // hard error rather than a silent fallback, since setting it signals intent.
 export const CONFIG_ENV_VAR = "CONTEXT_WRAPPER_CONFIG";
 
-export function findConfig(
-  startDir: string,
-): { config: Config; configPath: string } | null {
+export interface FoundConfig {
+  config: Config;
+  configPath: string;
+  /**
+   * What a relative source `path` resolves against. A discovered config
+   * belongs to the directory holding its `.claude/`, so a launch from any
+   * subdirectory resolves the same files. A config named by the env var
+   * belongs to no project tree and resolves against `startDir`.
+   */
+  sourceBase: string;
+}
+
+export function findConfig(startDir: string): FoundConfig | null {
   const override = process.env[CONFIG_ENV_VAR];
   if (override) {
     const configPath = resolve(override);
@@ -82,7 +92,7 @@ export function findConfig(
       );
     }
     try {
-      return { config: JSON.parse(raw), configPath };
+      return { config: JSON.parse(raw), configPath, sourceBase: resolve(startDir) };
     } catch (err) {
       throw new Error(
         `${CONFIG_ENV_VAR} config at "${configPath}" is not valid JSON: ${(err as Error).message}`,
@@ -96,7 +106,7 @@ export function findConfig(
     const candidate = join(dir, ".claude", "context-mode.json");
     try {
       const raw = readFileSync(candidate, "utf-8");
-      return { config: JSON.parse(raw), configPath: candidate };
+      return { config: JSON.parse(raw), configPath: candidate, sourceBase: dir };
     } catch {
       // not found here, keep walking
     }
@@ -151,10 +161,11 @@ export function readFile(fullPath: string, baseDir?: string): ResolvedFile | nul
   }
 }
 
-function resolveSourceFiles(source: SourceConfig): ResolvedFile[] {
+function resolveSourceFiles(source: SourceConfig, sourceBase: string): ResolvedFile[] {
+  const basePath = resolve(sourceBase, source.path || ".");
+
   // Strategy 1: explicit paths
   if (source.paths) {
-    const basePath = source.path || ".";
     return source.paths
       .map((p) => resolve(basePath, p))
       .map((p) => readFile(p, basePath))
@@ -163,7 +174,7 @@ function resolveSourceFiles(source: SourceConfig): ResolvedFile[] {
 
   // Strategy 2: exec command → JSON array of paths
   if (source.exec) {
-    const cwd = source.path || process.cwd();
+    const cwd = basePath;
     try {
       const output = execSync(source.exec, {
         cwd,
@@ -191,8 +202,8 @@ function resolveSourceFiles(source: SourceConfig): ResolvedFile[] {
 
   // Strategy 3: glob (flat or recursive)
   if (source.glob && source.path) {
-    return walkDir(source.path, source.glob, !!source.recursive)
-      .map((p) => readFile(p, source.path!))
+    return walkDir(basePath, source.glob, !!source.recursive)
+      .map((p) => readFile(p, basePath))
       .filter((f): f is ResolvedFile => f !== null);
   }
 
@@ -334,6 +345,7 @@ export function prewarm(
   config: Config,
   storageRoot: string,
   projectDir: string,
+  sourceBase: string,
 ): {
   totalSources: number;
   totalChunks: number;
@@ -350,7 +362,7 @@ export function prewarm(
   const summaries = new Map<string, PrewarmSourceSummary>();
 
   for (const source of config.sources) {
-    const files = resolveSourceFiles(source);
+    const files = resolveSourceFiles(source, sourceBase);
     if (files.length === 0) continue;
 
     for (const file of files) {

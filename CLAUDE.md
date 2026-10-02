@@ -48,7 +48,7 @@ Hidden: `ctx_stats`, `ctx_doctor`, `ctx_upgrade`, `ctx_purge`, `ctx_insight`.
 ### Pre-Warm Phase
 1. Walk up from CWD looking for `.claude/context-mode.json` (first match wins). `CONTEXT_WRAPPER_CONFIG`, if set, overrides discovery with an exact file path (skips the walk; hard-errors if unreadable/invalid)
 2. Spawn upstream with `CONTEXT_MODE_DIR` pointing at a wrapper-owned temp root under `/tmp/context-mode-*`
-3. Resolve source files via three strategies: glob, exec, or explicit paths
+3. Resolve source files via three strategies: glob, exec, or explicit paths. A relative source `path` resolves against `findConfig`'s `sourceBase`: the directory holding `.claude/` when discovered, the launch CWD under `CONTEXT_WRAPPER_CONFIG`
 4. Preprocess (strip frontmatter, prefix dates, collapse blanks)
 5. Resolve the exact upstream content DB path inside the temp root and index into it using `ContentStore`
 6. Upstream's lazy `getStore()` opens that pre-warmed DB on first tool call
