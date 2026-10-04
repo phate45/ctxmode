@@ -11,6 +11,12 @@
  * Usage:
  *   bun run check            — compare against manifest
  *   bun run check --update   — accept current state as new baseline
+ *
+ * Exit codes:
+ *   0  no drift, or the baseline was written
+ *   1  informational drift only; accept with --update
+ *   2  could not ask: upstream is not installed or its server would not start
+ *   3  risk drift; a human or agent must review it before accepting
  */
 
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -77,10 +83,14 @@ function hash(content: string): string {
   return createHash("sha256").update(content).digest("hex").slice(0, 16);
 }
 
+/**
+ * A missing file reads as empty, so a deleted coupling file surfaces as
+ * fingerprint drift. A missing package.json still fails its JSON.parse,
+ * which is the "upstream is not installed" case.
+ */
 function readUpstream(relPath: string): string {
   const full = join(upstream, relPath);
-  if (!existsSync(full)) throw new Error(`Missing: ${relPath}`);
-  return readFileSync(full, "utf-8");
+  return existsSync(full) ? readFileSync(full, "utf-8") : "";
 }
 
 function getCurrentTag(): string {
@@ -396,11 +406,12 @@ async function runCli(): Promise<void> {
     console.log(
       `  ${result.blockingChanges.length} blocking change(s) detected. Review above, then run with --update to accept.\n`,
     );
-    process.exit(1);
+    process.exit(3);
   }
 
   if (result.changes.length > 0) {
     console.log("  Informational change(s) only. Run with --update to accept.\n");
+    process.exit(1);
   }
 }
 
@@ -411,6 +422,6 @@ const isMain = process.argv[1]
 if (isMain) {
   runCli().catch((err) => {
     console.error(err);
-    process.exit(1);
+    process.exit(2);
   });
 }
