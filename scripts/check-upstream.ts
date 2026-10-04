@@ -20,18 +20,12 @@ import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { TOOL_MAP } from "../src/tool-map.ts";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
 const upstream = join(root, "node_modules", "context-mode");
 const manifestPath = join(root, "upstream.manifest.json");
-const TOOL_NAME_MAP = {
-  execute: "ctx_execute",
-  index: "ctx_index",
-  search: "ctx_search",
-  fetch_and_index: "ctx_fetch_and_index",
-  batch_execute: "ctx_batch_execute",
-} as const;
 
 // ── Types ──
 
@@ -251,7 +245,7 @@ async function buildProbes(): Promise<Probe[]> {
     severity: "risk",
     extract: () => {
       const names = new Set(tools.map((tool) => tool.name));
-      return Object.entries(TOOL_NAME_MAP)
+      return Object.entries(TOOL_MAP)
         .map(([wrapperName, upstreamName]) => `${wrapperName}=${names.has(upstreamName) ? upstreamName : "<missing>"}`)
         .join("\n");
     },

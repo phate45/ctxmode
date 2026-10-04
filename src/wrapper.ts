@@ -38,17 +38,9 @@ import {
   applySearchReminderFilter,
   sanitizeUpstreamTextContent,
 } from "./output-filter.ts";
+import { TOOL_MAP } from "./tool-map.ts";
 
 // ── Tool Mapping ────────────────────────────────────────────────────
-
-/** Tools we expose to Claude Code. Maps our name → upstream ctx_ name. */
-const TOOL_MAP: Record<string, string> = {
-  execute: "ctx_execute",
-  index: "ctx_index",
-  search: "ctx_search",
-  fetch_and_index: "ctx_fetch_and_index",
-  batch_execute: "ctx_batch_execute",
-};
 
 /** Reverse lookup: upstream name → our name. */
 const REVERSE_MAP = new Map(
