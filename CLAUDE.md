@@ -13,12 +13,15 @@ See `README.md` for the user-facing integration guide.
 | File | Purpose |
 |------|---------|
 | `src/wrapper.ts` | Entry point. Middleman MCP: spawns upstream server as subprocess, forces temp-scoped storage, pre-warms DB, forwards tool calls with name mapping, and intercepts path-based indexing. |
+| `src/tool-map.ts` | `TOOL_MAP`: our tool names → upstream `ctx_*` names. Shared by the wrapper and the upstream check. |
+| `src/output-filter.ts` | Post-processes upstream tool output: version-reminder stripping, `searchReminder` rewriting. |
 | `src/prewarm.ts` | Config discovery, file resolution (glob/exec/paths), preprocessing, content DB path resolution, ContentStore.index(). |
 | `wrapper.bundle.mjs` | Built artifact. `esbuild` output of `src/wrapper.ts` — what users run via `node`. |
 | `setup.js` | Install script. Detects package manager (bun/pnpm/npm), installs deps, prints `claude mcp add` command. |
 | `subagent-hook.mjs` | Claude Code PreToolUse hook — injects routing instructions into subagent prompts. |
 | `scripts/check-upstream.ts` | Validates upstream coupling points against `upstream.manifest.json`. |
-| `scripts/bump.ts` | Updates git dep tag → installs → runs check. |
+| `scripts/bump.ts` | Updates git dep tag → installs → runs check, accepting informational drift. |
+| `justfile` | The upkeep loop: `status`, `upgrade`, `gate`. Each recipe's exit codes are in its `[doc]`. |
 | `package.json` | Dependencies: `context-mode` (upstream server), `@modelcontextprotocol/sdk` (MCP protocol), `zod`. |
 
 ## Architecture
@@ -78,17 +81,21 @@ import { resolveContentStorePath } from "../node_modules/context-mode/src/sessio
 Used to compute the exact DB path the upstream child will open inside the wrapper-owned temp storage root.
 
 ### 3. Tool Name Mapping
-The `TOOL_MAP` constant maps our names to upstream `ctx_*` names. If upstream renames tools, update the map.
+`TOOL_MAP` in `src/tool-map.ts` maps our names to upstream `ctx_*` names. If upstream renames tools, update the map.
 
 All other upstream internals (sandbox execution, security checks, fetch behavior, search ranking, etc.) stay inside the subprocess — we don't reimplement them.
 
-## Upgrading context-mode
+## The loop
 
-1. Run `bun run bump v<new-tag>` — updates dep, installs, runs check
-2. Verify `ContentStore` constructor still accepts `dbPath`
-3. Verify `resolveContentStorePath` still exists and keeps the same `projectDir + contentDir -> dbPath` contract
-4. Verify tool names haven't changed (check `server.ts` `registerTool` calls)
-5. Run `just test` — prewarm, cwd routing, and wrapper-owned indexing should still pass
+`just status` → `just upgrade` → commit → push. Exit codes are the interface: `0` ok, `1` action needed, `2` could not ask, `3` human or agent needed. Only a `3` is a handoff.
+
+- `just upgrade [tag]` bumps to the given or latest stable tag, accepts version-only drift into `upstream.manifest.json`, and runs `just gate`.
+- A `3` from `upgrade` is risk drift in `upstream.manifest.json`: a coupling point, dependency, export map, or tool schema changed. The bumped tree stays in place. Read the check output, fix the wrapper or confirm the change is harmless, then `just update-manifest` and `just gate`.
+- `just gate` is the bar for every commit, not only upgrades: it fails when the committed `wrapper.bundle.mjs` lags `src/`.
+
+**Done means replicated.** A change is finished when `just gate` passes on its commit, the rebuilt bundle and `bun.lock` are in that commit, and `origin/master` carries it. The fleet replicates this repo to its work devboxes, and consumers there run the committed bundle against that lockfile.
+
+**This doc holds what is true at the current pin.** A fact that names a version the pin has moved past, or code that is gone, gets deleted; an explanation that belongs to one recipe or function moves into the comment beside it.
 
 ## Per-Project Configuration
 
