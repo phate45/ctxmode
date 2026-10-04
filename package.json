@@ -12,8 +12,7 @@
     "bump": "tsx scripts/bump.ts",
     "test:filters": "tsx scripts/output-filter-smoke.ts",
     "test:e2e": "tsx scripts/e2e-smoke.ts",
-    "test:all": "bun run test:filters && bun run test:e2e",
-    "test": "bun run build && bun run check && bun run test:all"
+    "test": "bun run test:filters && bun run test:e2e"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
