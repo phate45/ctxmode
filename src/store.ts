@@ -1163,7 +1163,7 @@ export class ContentStore {
   }
 
   /** Merge FTS5 b-tree segments for both porter and trigram indexes. */
-  #optimizeFTS(): void {
+  optimize(): void {
     try {
       this.#db.exec("INSERT INTO chunks(chunks) VALUES('optimize')");
       this.#db.exec("INSERT INTO chunks_trigram(chunks_trigram) VALUES('optimize')");
@@ -1171,7 +1171,6 @@ export class ContentStore {
   }
 
   close(): void {
-    this.#optimizeFTS(); // defragment before close
     closeDB(this.#db); // WAL checkpoint before close — important for persistent DBs
   }
 

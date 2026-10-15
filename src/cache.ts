@@ -195,6 +195,8 @@ export function prewarmSession(found: FoundConfig, sessionPath: string): Prewarm
           else store.deleteByLabel(label);
         }
       });
+      // Incremental diffs stay within FTS5 automerge; a full merge only pays off after a cold build.
+      if (!warm) store.optimize();
     } finally {
       store.close();
     }
