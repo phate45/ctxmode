@@ -247,3 +247,20 @@ test("path-reading tools share one guard: deny rules, regular files only, execut
     await client.close();
   }
 }, 20_000);
+
+test("execute reports the caller's line numbers, with and without `path`", async () => {
+  const root = tempRoot();
+  write(join(root, "data.txt"), "payload\n");
+  const client = await connect(root);
+  try {
+    const plain = await call(client, "execute", { language: "javascript", code: "\n\nthrow new Error('x');" });
+    expect(plain.text).toMatch(/script\.js:3:/);
+    const file = await call(client, "execute", { language: "javascript", path: "data.txt", code: "\n\nthrow new Error(FILE_CONTENT.trim());" });
+    expect(file.text).toMatch(/error: payload/);
+    expect(file.text).toMatch(/script\.js:3:/);
+    const shell = await call(client, "execute", { language: "shell", path: "data.txt", code: "test \"$FILE_CONTENT\" = payload\nfalse-command-xyz" });
+    expect(shell.text).toMatch(/line 2: false-command-xyz/);
+  } finally {
+    await client.close();
+  }
+});

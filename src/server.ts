@@ -7,7 +7,7 @@ import { randomBytes } from "node:crypto";
 import { cpus } from "node:os";
 import { z } from "zod";
 import pkg from "../package.json";
-import { PolyglotExecutor } from "./executor.js";
+import { PolyglotExecutor, type Language } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
 import { ContentStore } from "./store.js";
 import { deleteDBFiles } from "./db-base.js";
@@ -21,7 +21,6 @@ import {
   evaluateFilePath,
   evaluateProjectContainment,
 } from "./security.js";
-import { detectRuntimes, type Language } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { charSafePrefix } from "./truncate.js";
 import { FloodGuard } from "./search/flood-guard.js";
@@ -60,7 +59,6 @@ process.on("uncaughtException", (err) => {
   }
 });
 
-const runtimes = detectRuntimes();
 export const server = new McpServer({
   name: "ctxmode",
   version: pkg.version,
@@ -75,10 +73,7 @@ server.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts
 server.server.setRequestHandler(ListResourcesRequestSchema, async () => ({ resources: [] }));
 server.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({ resourceTemplates: [] }));
 
-const executor = new PolyglotExecutor({
-  runtimes,
-  projectRoot: () => getProjectDir(),
-});
+const executor = new PolyglotExecutor();
 
 // Lazy singleton — no DB overhead unless index/search is used
 let _store: ContentStore | null = null;
@@ -683,8 +678,7 @@ server.registerTool(
       // For JS/TS: wrap in an async function so top-level await works
       let instrumentedCode = code;
       if (language === "javascript" || language === "typescript") {
-        instrumentedCode = `async function __cm_main(){
-${code}
+        instrumentedCode = `async function __cm_main(){${code}
 }
 __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}`;
       }

@@ -12,7 +12,14 @@ for (const language of ["javascript", "typescript"] as const) {
   });
 }
 
-test("error line numbers are unshifted", async () => {
-  const r = await executor.execute({ language: "javascript", code: "\n\nthrow new Error('x');", timeout: 20_000 });
-  expect(r.stderr).toMatch(/:3:/);
+test("a shebang and a \"use strict\" directive keep working, with unshifted line numbers", async () => {
+  const code = `#!/usr/bin/env bun\n"use strict";\nconsole.log(String(process.env.BUN_BE_BUN), (function () { return this; })() === undefined);\nthrow new Error("x");`;
+  const r = await executor.execute({ language: "javascript", code, timeout: 20_000 });
+  expect(r.stdout.trim()).toBe("undefined true");
+  expect(r.stderr).toMatch(/script\.js:4:/);
+});
+
+test("shell error line numbers are unshifted", async () => {
+  const r = await executor.execute({ language: "shell", code: "true\nfalse-command-xyz", timeout: 20_000 });
+  expect(r.stderr).toMatch(/line 2: false-command-xyz/);
 });
