@@ -1,117 +1,61 @@
-# context-wrapper
+# ctxmode
 
 ## What This Is
 
-A middleman MCP server wrapping [context-mode](https://github.com/mksglu/context-mode). Pre-warms the FTS5 database with configured markdown content on startup (eliminating cold-start), keeps upstream storage in a temp sandbox, renames tools (drops `ctx_` prefix), merges `execute`+`execute_file`, and hides internal/session tools.
+A context-saving MCP server for Claude Code, shipped as one compiled Bun binary. It is a hard fork of [mksglu/context-mode](https://github.com/mksglu/context-mode) at v1.0.169 (`442f1eb`), cut to six tools: `execute`, `index`, `search`, `fetch_and_index`, `batch_execute`, `batch_read`. Its own addition is the pre-warmed knowledge base: configured markdown is indexed before the first tool call and cached per repo, so a warm start takes tens of milliseconds.
 
-Includes subagent routing hooks for Claude Code.
-
-See `README.md` for the user-facing integration guide.
+See `README.md` for the user-facing guide and `MIGRATION.md` for moving consumers off context-wrapper.
 
 ## File Overview
 
 | File | Purpose |
 |------|---------|
-| `src/wrapper.ts` | Entry point. Middleman MCP: spawns upstream server as subprocess, forces temp-scoped storage, pre-warms DB, forwards tool calls with name mapping, and intercepts path-based indexing. |
-| `src/tool-map.ts` | `TOOL_MAP`: our tool names → upstream `ctx_*` names. Shared by the wrapper and the upstream check. |
-| `src/output-filter.ts` | Post-processes upstream tool output: version-reminder stripping, `searchReminder` rewriting. |
-| `src/prewarm.ts` | Config discovery, file resolution (glob/exec/paths), preprocessing, content DB path resolution, ContentStore.index(). |
-| `wrapper.bundle.mjs` | Built artifact. `esbuild` output of `src/wrapper.ts` — what users run via `node`. |
-| `setup.js` | Install script. Detects package manager (bun/pnpm/npm), installs deps, prints `claude mcp add` command. |
-| `subagent-hook.mjs` | Claude Code PreToolUse hook — injects routing instructions into subagent prompts. |
-| `scripts/check-upstream.ts` | Validates upstream coupling points against `upstream.manifest.json`. |
-| `scripts/bump.ts` | Updates git dep tag → installs → runs check, accepting informational drift. |
-| `justfile` | The upkeep loop: `status`, `upgrade`, `gate`. Each recipe's exit codes are in its `[doc]`. |
-| `package.json` | Dependencies: `context-mode` (upstream server), `@modelcontextprotocol/sdk` (MCP protocol), `zod`. |
+| `src/main.ts` | Entry point. Subcommands: `serve` (default), `prewarm`, `hook`, `--version`. |
+| `src/server.ts` | MCP server: tool definitions, descriptions, search throttle, fetch + HTML→markdown, path ingest for `index`. |
+| `src/cache.ts` | Baseline DB lifecycle: restore, diff against the manifest, apply, write back, session DB cleanup. |
+| `src/prewarm.ts` | Config discovery, source resolution (glob/exec/paths), preprocessing, `PREPROCESS_VERSION`. |
+| `src/hook.ts` | PreToolUse subagent routing hook. |
+| `src/store.ts` | `ContentStore`: FTS5 porter + trigram tables, chunking, search, `STORE_VERSION`. |
+| `src/executor.ts`, `src/runtime.ts` | Sandboxed execution of JS/TS/Python/shell. |
+| `src/security.ts`, `src/util/claude-config.ts` | Deny rules read from Claude Code settings. A trust boundary. |
+| `src/db-base.ts` | `bun:sqlite` setup, WAL pragmas. |
+| `test/golden/` | Synthetic corpus + recorded transcript of the pre-fork wrapper; the parity net. |
+| `scripts/parity-rank.ts` | Ranking parity on a real corpus. Its outputs are private and never committed. |
+
+Files that start with `// Vendored from mksglu/context-mode ...` came from upstream. Keep them recognizable when editing, so an upstream fix can still be ported by hand.
 
 ## Architecture
 
-### Middleman MCP
+One process, no subprocess or proxy. `bun:sqlite` is the only database driver. JS/TS code runs through `process.execPath` with `BUN_BE_BUN=1`, so the binary is its own Bun; the variable is deleted before user code runs, because anything it spawns (Claude Code included) would otherwise start as Bun.
 
-```
-Claude Code ↔ Our Server (stdin/stdout) ↔ [MCP Client → child process] ↔ Upstream Server
-```
+### Pre-warm cache
 
-Our process is both:
-- An MCP **server** facing Claude Code (low-level `Server` class, raw JSON schema passthrough)
-- An MCP **client** facing the upstream context-mode subprocess (spawned via `StdioClientTransport`)
+- Baseline: `<repo>/.ctxmode/baseline.db`. `<repo>` is the parent of `git --git-common-dir` (worktrees share it), else the config's `sourceBase`. The directory writes its own `.gitignore` of `*`.
+- The manifest lives inside the baseline as tables: one cache key plus `(label, source, path, mtime_ns, size, sha256)` per file. One file means one atomic rename, so concurrent write-backs need no lock.
+- Cache key = `STORE_VERSION` + hash of the config's `sources` + `PREPROCESS_VERSION`. **Bump `STORE_VERSION` when chunking, schema or ranking inputs change, and `PREPROCESS_VERSION` when preprocessing output changes**; otherwise baselines keep stale content.
+- Session DB: `${XDG_CACHE_HOME:-~/.cache}/ctxmode/sessions/<pid>.db`, deleted on exit; dead-PID leftovers are swept at startup.
+- FTS rowids are `sourceId * 2^20 + n`, so deleting a source is a rowid range, not a scan of the UNINDEXED `source_id` column. Full `optimize` runs only after a cold build.
 
-### Tool Mapping
+### Config
 
-| Exposed to CC | Upstream Call | Notes |
-|---------------|-------------|-------|
-| `execute` | `ctx_execute` or `ctx_execute_file` | `path` param → file variant |
-| `index` | `ctx_index` | Direct for `content`; wrapper-owned path/file/folder ingest for `path` |
-| `search` | `ctx_search` | Name only |
-| `fetch_and_index` | `ctx_fetch_and_index` | Name only |
-| `batch_execute` | `ctx_batch_execute` | Name only |
-
-Hidden: `ctx_stats`, `ctx_doctor`, `ctx_upgrade`, `ctx_purge`, `ctx_insight`.
-
-### Pre-Warm Phase
-1. Walk up from CWD looking for `.claude/context-mode.json` (first match wins). `CONTEXT_WRAPPER_CONFIG`, if set, overrides discovery with an exact file path (skips the walk; hard-errors if unreadable/invalid)
-2. Spawn upstream with `CONTEXT_MODE_DIR` pointing at a wrapper-owned temp root under `/tmp/context-mode-*`
-3. Resolve source files via three strategies: glob, exec, or explicit paths. A relative source `path` resolves against `findConfig`'s `sourceBase`: the directory holding `.claude/` when discovered, the launch CWD under `CONTEXT_WRAPPER_CONFIG`
-4. Preprocess (strip frontmatter, prefix dates, collapse blanks)
-5. Resolve the exact upstream content DB path inside the temp root and index into it using `ContentStore`
-6. Upstream's lazy `getStore()` opens that pre-warmed DB on first tool call
-
-### Startup Sequence
-1. Spawn upstream `server.bundle.mjs` as child process with temp-scoped `CONTEXT_MODE_DIR`
-2. MCP client connect + initialize handshake
-3. Pre-warm the resolved upstream content DB path inside that temp root
-4. List upstream tools, build remapped tool list
-5. Register `tools/list` and `tools/call` handlers with name mapping + wrapper-owned path indexing
-6. Connect server transport to Claude Code's stdio
-
-## Coupling Points
-
-The middleman design currently couples to three points:
-
-### 1. ContentStore Import (pre-warm only)
-```typescript
-import { ContentStore } from "../node_modules/context-mode/src/store.ts";
-```
-Used at startup to populate the FTS5 database. Constructor accepts optional `dbPath`.
-
-### 2. Content DB Path Resolution
-```typescript
-import { resolveContentStorePath } from "../node_modules/context-mode/src/session/db.ts";
-```
-Used to compute the exact DB path the upstream child will open inside the wrapper-owned temp storage root.
-
-### 3. Tool Name Mapping
-`TOOL_MAP` in `src/tool-map.ts` maps our names to upstream `ctx_*` names. If upstream renames tools, update the map.
-
-All other upstream internals (sandbox execution, security checks, fetch behavior, search ranking, etc.) stay inside the subprocess — we don't reimplement them.
-
-## The loop
-
-`just status` → `just upgrade` → commit → push. Exit codes are the interface: `0` ok, `1` action needed, `2` could not ask, `3` human or agent needed. Only a `3` is a handoff.
-
-- `just upgrade [tag]` bumps to the given or latest stable tag, accepts version-only drift into `upstream.manifest.json`, and runs `just gate`.
-- A `3` from `upgrade` is risk drift in `upstream.manifest.json`: a coupling point, dependency, export map, or tool schema changed. The bumped tree stays in place. Read the check output, fix the wrapper or confirm the change is harmless, then `just update-manifest` and `just gate`.
-- `just gate` is the bar for every commit, not only upgrades: it fails when the committed `wrapper.bundle.mjs` lags `src/`.
-
-**Done means replicated.** A change is finished when `just gate` passes on its commit, the rebuilt bundle and `bun.lock` are in that commit, and `origin/master` carries it. The fleet replicates this repo to its work devboxes, and consumers there run the committed bundle against that lockfile.
-
-**This doc holds what is true at the current pin.** A fact that names a version the pin has moved past, or code that is gone, gets deleted; an explanation that belongs to one recipe or function moves into the comment beside it.
-
-## Per-Project Configuration
-
-Each project that uses context-wrapper creates `.claude/context-mode.json` defining its sources. This file does NOT live in this repo — it lives in each consuming project.
-
-## File Resolution Strategies
+Walk up from CWD for `.claude/ctxmode.json` (first match wins). `CTXMODE_CONFIG` names an exact file instead and hard-errors if unreadable. A relative source `path` resolves against `sourceBase`: the directory holding `.claude/`, or the launch CWD under `CTXMODE_CONFIG`. Each consuming project owns its config; none lives here.
 
 | Strategy | Required Fields | Description |
 |----------|----------------|-------------|
 | **glob** | `path` + `glob` | Match filenames in a directory. `recursive: true` for subdirs. |
-| **exec** | `exec` | Shell command outputting JSON array of file paths. 10s timeout. |
+| **exec** | `exec` | Shell command outputting a JSON array of file paths. 10s timeout. |
 | **paths** | `paths` | Explicit array of file paths. |
 
-## Preprocessing Options
+Preprocessing: `stripFrontmatter`, `prefixDates` (for `YYYY-MM-DD.md`), and blank-line collapsing (always).
 
-Pure functions in `src/prewarm.ts`:
-- `stripFrontmatter` — removes YAML `---`/`---` blocks from file start
-- `prefixDates` — for `YYYY-MM-DD.md` files, prefixes topic headings with `[date]`
-- Blank line collapsing (always applied)
+## The loop
+
+`just gate` → commit → `just release` → push. Exit codes are the interface: `0` ok, `1` action needed, `2` could not run.
+
+- `just gate` is the bar for every commit: typecheck, unit/e2e tests, and the golden check.
+- A deliberate behaviour change shows up as a golden mismatch. List it in `test/golden/expected-differences.json` with a reason; never re-record `expected.json` to hide one.
+- `just release` publishes `release/ctxmode` + `.sha256` only after the compiled binary passes smoke. Fleet takes it through `just fleet-ready ctxmode` and `just artifact`.
+
+**Done means released.** A change is finished when `just gate` passes on its commit, `origin/master` carries it, and `just release` has published a binary built from that commit.
+
+**This doc holds what is true at HEAD.** A fact about code that is gone gets deleted; an explanation that belongs to one function moves into the comment beside it.

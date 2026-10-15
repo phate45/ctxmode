@@ -1,28 +1,38 @@
-# context-wrapper
+# ctxmode
 
-Pre-warm wrapper for the [context-mode](https://github.com/mksglu/context-mode) MCP server. It keeps upstream storage in a temp sandbox, indexes configured markdown content before the first tool call, and exposes a narrow tool surface focused on sandbox execution and search.
+A context-saving MCP server for Claude Code: sandboxed code execution whose output stays out of the context window, and an FTS5 knowledge base that is pre-warmed from configured markdown before the first tool call.
+
+ctxmode is a hard fork of [mksglu/context-mode](https://github.com/mksglu/context-mode) at v1.0.169, cut down to six tools and rebuilt as a single Bun binary. See [NOTICE](NOTICE) and [LICENSE](LICENSE) (Elastic License 2.0). Moving off context-wrapper is covered in [MIGRATION.md](MIGRATION.md).
 
 ## Requirements
 
-- **Node.js** (v22+) — runtime (context-mode depends on `better-sqlite3`, a native addon [not yet supported](https://github.com/oven-sh/bun/issues/4290) by bun's runtime)
-- A package manager: **bun** (preferred), pnpm, or npm
+- **Bun** to build. The compiled binary needs nothing else: it embeds the Bun runtime and `bun:sqlite`, and runs JS/TS code as its own Bun. Python and shell code use whatever is on `PATH`.
+- Linux x86_64, glibc 2.17 or newer.
 
 ## Setup
 
 ```bash
-cd context-wrapper/
-node setup.js    # or: bun run setup.js
+bun install
+just release          # gate -> build -> smoke -> release/ctxmode + .sha256
 ```
 
-This installs dependencies and prints the `claude mcp add` command to wire up the wrapper. Run that command to register it with Claude Code.
+Install `release/ctxmode` somewhere stable (the fleet uses `~/.local/share/ctxmode/bin/ctxmode`) and register it in a project's `.mcp.json`:
 
-If you already have a `context-mode` entry in your `.mcp.json`, replace it — this wrapper supersedes the direct bundle invocation.
+```json
+{
+  "mcpServers": {
+    "ctxmode": { "type": "stdio", "command": "${HOME}/.local/share/ctxmode/bin/ctxmode" }
+  }
+}
+```
+
+For development, `bun src/main.ts` runs the same server from source.
 
 ## Project Configuration
 
-Create `.claude/context-mode.json` in any project that should have pre-warmed content. To point at a config file outside the project tree, set `CONTEXT_WRAPPER_CONFIG` to its absolute path — the wrapper loads it verbatim and skips the upward `.claude/context-mode.json` search.
+Create `.claude/ctxmode.json` in any project that should have pre-warmed content. To point at a config file outside the project tree, set `CTXMODE_CONFIG` to its absolute path — ctxmode loads it verbatim and skips the upward `.claude/ctxmode.json` search.
 
-A relative source `path` resolves against the project the config belongs to: the directory holding `.claude/` for a discovered config, so every subdirectory launch indexes the same files, and the launch CWD for a config named by `CONTEXT_WRAPPER_CONFIG`. An exec or paths source that omits `path` uses that same directory.
+A relative source `path` resolves against the project the config belongs to: the directory holding `.claude/` for a discovered config, so every subdirectory launch indexes the same files, and the launch CWD for a config named by `CTXMODE_CONFIG`. An exec or paths source that omits `path` uses that same directory.
 
 Each source needs a `label` and a file selection strategy. Three strategies are available:
 
@@ -104,7 +114,7 @@ Hardcode a list of file paths. Relative paths resolve from `path`.
 
 ### Public Tool Surface
 
-The wrapper exposes only:
+ctxmode exposes only:
 
 - `execute`
 - `index`
@@ -113,7 +123,7 @@ The wrapper exposes only:
 - `batch_execute`
 - `batch_read`
 
-Upstream meta/session tools such as stats, doctor, upgrade, purge, and insight are hidden.
+Upstream's meta and session tools (stats, doctor, upgrade, purge, insight, timeline search) are not part of the fork.
 
 ### Searching Pre-Warmed Content
 
@@ -127,7 +137,7 @@ search(queries: ["FTS5 schema"], source: "research-notes")
 
 The `source` parameter matches against labels. A source labeled `"work-logs"` creates entries like `"work-logs: 2026-02-28.md"`, so `source: "work-logs"` matches all files in that source.
 
-At startup the wrapper appends a manifest of the pre-warmed corpus to the `search` tool's description — each source's `label`, file count, and `description` (if set). Hosts that pass `tools/list` descriptions through to the model surface this automatically, so the agent knows what is already searchable.
+At startup ctxmode appends a manifest of the pre-warmed corpus to the `search` tool's description — each source's `label`, file count, and `description` (if set). Hosts that pass `tools/list` descriptions through to the model surface this automatically, so the agent knows what is already searchable.
 
 ## Runtime Indexing
 
@@ -157,17 +167,22 @@ index(path: "/path/to/docs", glob: "*.txt", recursive: true, source: "docs")
 | `stripFrontmatter` | path | `true` | Strip YAML frontmatter before indexing |
 | `prefixDates` | path | `false` | For `YYYY-MM-DD.md`, prefix `##` headings with `[date]` |
 
-Path-based indexing uses wrapper preprocessing, then forwards the transformed content to upstream indexing. Each file becomes its own searchable source.
+Path-based indexing applies the same preprocessing as pre-warming, and files matching a Read deny rule are skipped. Each file becomes its own searchable source.
 
 ## How It Works
 
-The wrapper runs three phases on startup:
+On startup ctxmode:
 
-1. **Discover** — Walks up from CWD looking for `.claude/context-mode.json`. Set `CONTEXT_WRAPPER_CONFIG` to an exact config file path to skip the walk and load that file directly (a set-but-unreadable or invalid file is a hard error).
-2. **Launch upstream in temp storage** — Spawns the upstream server with `CONTEXT_MODE_DIR` pointing at a wrapper-owned temp root under `/tmp/context-mode-*`
-3. **Pre-warm** — Resolves the exact upstream content DB path inside that temp root and populates it with preprocessed content from the configured sources before the first search call
+1. **Discovers** the config: walks up from CWD looking for `.claude/ctxmode.json`. Set `CTXMODE_CONFIG` to an exact config file path to skip the walk and load that file directly (a set-but-unreadable or invalid file is a hard error).
+2. **Restores the baseline**: `<repo>/.ctxmode/baseline.db` holds the indexed corpus plus a manifest of every source file's path, mtime, size and sha256. `<repo>` is the main checkout found via `git --git-common-dir`, so worktrees share one baseline; outside git it is the config's directory. The directory carries its own `.gitignore`.
+3. **Applies the diff**: files whose mtime and size match are skipped; the rest are hashed, and only changed, added or removed files are re-indexed, in a private session copy under `~/.cache/ctxmode/sessions/<pid>.db`.
+4. **Writes back** an updated baseline when anything changed (`VACUUM INTO` a staging file, then an atomic rename), and serves.
 
-If no config file is found, the wrapper still launches the upstream server in temp storage but skips pre-warming.
+A warm start takes tens of milliseconds; a cold build (first run, or a config or store-format change) indexes everything once. The session DB is deleted on exit, and session DBs of dead processes are swept at the next startup.
+
+`ctxmode prewarm` runs the same build/refresh without serving, which is useful to warm a project ahead of its first session.
+
+If no config file is found, ctxmode serves with an empty knowledge base.
 
 ## Preprocessing Details
 
@@ -185,7 +200,7 @@ For files named `YYYY-MM-DD.md` (work logs):
 
 ## Search Reminder Control
 
-The upstream context-mode server progressively throttles `search()` calls and appends warning messages after the third call in a 60-second window. If these warnings create unwanted cognitive overhead, you can control them:
+ctxmode progressively throttles `search()` calls and appends warning messages after the third call in a 60-second window. If these warnings create unwanted cognitive overhead, you can control them:
 
 ```json
 {
@@ -200,15 +215,15 @@ The upstream context-mode server progressively throttles `search()` calls and ap
 | `false` | Strip all throttle warnings and block messages |
 | `"custom text"` | Replace warnings with your own text |
 
-**Note:** This only controls the *message* — the upstream throttling behavior (reduced results per query after 3 calls, hard block after 8) still applies.
+**Note:** This only controls the *message* — the throttling behavior (reduced results per query after 3 calls, hard block after 8) still applies.
 
 ## Subagent Hook (Optional)
 
-The wrapper includes `subagent-hook.mjs` — a PreToolUse hook that teaches subagents to use context-mode tools instead of flooding the parent's context with raw output.
+`ctxmode hook` is a PreToolUse hook that teaches subagents to use the ctxmode tools instead of flooding the parent's context with raw output.
 
 **What it does:**
 
-- Injects routing instructions into every subagent prompt, directing them to use `batch_execute`, `search`, `execute_file`, etc.
+- Injects routing instructions into every subagent prompt, directing them to use `batch_execute`, `search`, `execute`, etc.
 - Tells subagents to keep responses under 500 words and index detailed findings into the shared knowledge base (the parent can `search()` for them afterward)
 - Upgrades Bash subagents to general-purpose so they gain MCP tool access
 
@@ -223,7 +238,7 @@ The wrapper includes `subagent-hook.mjs` — a PreToolUse hook that teaches suba
         "hooks": [
           {
             "type": "command",
-            "command": "node /absolute/path/to/context-wrapper/subagent-hook.mjs"
+            "command": "${HOME}/.local/share/ctxmode/bin/ctxmode hook"
           }
         ]
       }
@@ -232,13 +247,9 @@ The wrapper includes `subagent-hook.mjs` — a PreToolUse hook that teaches suba
 }
 ```
 
-Replace the path with the absolute path to your `context-wrapper/` directory.
-
-**Note:** This hook nudges subagents toward context-mode tools but does not block standard tools. Subagents can still use Bash, Read, etc. when appropriate.
-
 ### Custom Subagent Profiles
 
-By default, all subagents get a 500-word response cap and dead-drop instructions, except `Plan` agents (full output) and a few skip types. You can override this per agent type in your `.claude/context-mode.json`:
+By default, all subagents get a 500-word response cap and dead-drop instructions, except `Plan` agents (full output) and a few skip types. You can override this per agent type in your `.claude/ctxmode.json`:
 
 ```json
 {
@@ -261,6 +272,14 @@ Each profile key matches against `subagent_type`. Three modes (mutually exclusiv
 
 Custom profiles take priority over all hardcoded defaults. You can override the built-in `Plan`, `Bash`, or skip-type behavior by defining a profile with that name.
 
-## Portability
+## Building and Releasing
 
-Copy this folder to another machine, run `node setup.js`, add the MCP server. The wrapper brings its own context-mode and better-sqlite3 as dependencies — only Node.js and a package manager (bun, pnpm, or npm) are required.
+| Recipe | Does |
+|--------|------|
+| `just gate` | Typecheck and tests, including the golden parity check |
+| `just build` | Compile `release/build/ctxmode`, check its glibc floor and linked libraries |
+| `just smoke` | Golden check, `--version` and a hook round-trip against the compiled binary |
+| `just release` | gate, build, smoke, then publish `release/ctxmode` and its `.sha256` |
+| `just fleet-ready ctxmode` / `just artifact` | Version, and path of a release that is current with HEAD, for fleet delivery |
+
+`ctxmode --version` prints the package version and the git SHA it was built from.
