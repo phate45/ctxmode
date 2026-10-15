@@ -1,15 +1,16 @@
 /**
  * Pre-warm + markdown ingest helpers for ctxmode.
  *
- * Discovers .claude/ctxmode.json, resolves source files, applies our
- * markdown-specific preprocessing, and indexes into the FTS5 content
- * database so search() works immediately.
+ * Discovers .claude/ctxmode.json, resolves source files and applies our
+ * markdown-specific preprocessing; cache.ts indexes them.
  */
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, dirname, basename, resolve, relative } from "node:path";
-import { ContentStore } from "./store.ts";
+
+/** Version of source resolution and preprocessing; a change invalidates baselines. */
+export const PREPROCESS_VERSION = 1;
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -160,16 +161,17 @@ export function readFile(fullPath: string, baseDir?: string): ResolvedFile | nul
   }
 }
 
-function resolveSourceFiles(source: SourceConfig, sourceBase: string): ResolvedFile[] {
+/** A configured source's files as `name` (relative to the source base) and absolute `path`. */
+export function resolveSourcePaths(
+  source: SourceConfig,
+  sourceBase: string,
+): Array<{ name: string; path: string }> {
   const basePath = resolve(sourceBase, source.path || ".");
+  const named = (paths: string[], base: string) =>
+    paths.map((p) => resolve(base, p)).map((p) => ({ name: relative(base, p), path: p }));
 
   // Strategy 1: explicit paths
-  if (source.paths) {
-    return source.paths
-      .map((p) => resolve(basePath, p))
-      .map((p) => readFile(p, basePath))
-      .filter((f): f is ResolvedFile => f !== null);
-  }
+  if (source.paths) return named(source.paths, basePath);
 
   // Strategy 2: exec command → JSON array of paths
   if (source.exec) {
@@ -187,10 +189,7 @@ function resolveSourceFiles(source: SourceConfig, sourceBase: string): ResolvedF
         );
         return [];
       }
-      return paths
-        .map((p: string) => resolve(cwd, p))
-        .map((p) => readFile(p, cwd))
-        .filter((f): f is ResolvedFile => f !== null);
+      return named(paths, cwd);
     } catch (err: any) {
       process.stderr.write(
         `[ctxmode] exec for "${source.label}" failed: ${err.message}\n`,
@@ -201,9 +200,7 @@ function resolveSourceFiles(source: SourceConfig, sourceBase: string): ResolvedF
 
   // Strategy 3: glob (flat or recursive)
   if (source.glob && source.path) {
-    return walkDir(basePath, source.glob, !!source.recursive)
-      .map((p) => readFile(p, basePath))
-      .filter((f): f is ResolvedFile => f !== null);
+    return named(walkDir(basePath, source.glob, !!source.recursive), basePath);
   }
 
   process.stderr.write(
@@ -255,13 +252,6 @@ export function preprocessText(
   if (opts?.stripFrontmatter) next = stripFrontmatter(next);
   if (opts?.prefixDates) next = prefixDates(next, filename);
   return collapseBlankLines(next);
-}
-
-function preprocessFile(file: ResolvedFile, source: SourceConfig): string {
-  return preprocessText(file.content, file.name, {
-    stripFrontmatter: source.stripFrontmatter,
-    prefixDates: source.prefixDates,
-  });
 }
 
 // ── Wrapper-side Path Indexing ──────────────────────────────────────
@@ -318,67 +308,12 @@ export function preprocessIndexPathFiles(
 
 // ── Pre-Warm ────────────────────────────────────────────────────────
 
-/** Per-source-label rollup of what prewarm actually indexed. */
+/** Per-source-label rollup of what prewarm indexed. */
 export interface PrewarmSourceSummary {
   label: string;
   description?: string;
   files: number;
   chunks: number;
-}
-
-/**
- * Index configured sources into the FTS5 database at `dbPath`.
- */
-export function prewarm(
-  config: Config,
-  dbPath: string,
-  sourceBase: string,
-): {
-  totalSources: number;
-  totalChunks: number;
-  sources: PrewarmSourceSummary[];
-} {
-  const store = new ContentStore(dbPath);
-
-  let totalSources = 0;
-  let totalChunks = 0;
-  // Aggregate per source.label, preserving config order. Two source entries
-  // sharing a label fold into one manifest entry.
-  const summaries = new Map<string, PrewarmSourceSummary>();
-
-  // One transaction for the whole corpus: per-file commits cost about 40% more.
-  store.transaction(() => {
-    for (const source of config.sources) {
-      const files = resolveSourceFiles(source, sourceBase);
-      if (files.length === 0) continue;
-
-      for (const file of files) {
-        const text = preprocessFile(file, source);
-        if (text.trim().length === 0) continue;
-        const label = `${source.label}: ${file.name}`;
-        const result = store.index({ content: text, source: label });
-        totalSources++;
-        totalChunks += result.totalChunks;
-
-        const summary = summaries.get(source.label) ?? {
-          label: source.label,
-          description: source.description,
-          files: 0,
-          chunks: 0,
-        };
-        summary.files++;
-        summary.chunks += result.totalChunks;
-        summaries.set(source.label, summary);
-      }
-    }
-  });
-
-  store.close();
-  return {
-    totalSources,
-    totalChunks,
-    sources: [...summaries.values()],
-  };
 }
 
 /**

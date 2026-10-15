@@ -2,7 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { readFileSync, writeSync, rmSync, mkdtempSync, statSync } from "node:fs";
+import { readFileSync, writeSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { tmpdir, cpus } from "node:os";
@@ -11,6 +11,8 @@ import pkg from "../package.json";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
 import { ContentStore, type IndexResult } from "./store.js";
+import { deleteDBFiles } from "./db-base.js";
+import { formatReport, prewarmSession, startSession } from "./cache.js";
 import { composeFetchCacheKey } from "./fetch-cache.js";
 import {
   readBashPolicies,
@@ -28,7 +30,6 @@ import { FloodGuard } from "./search/flood-guard.js";
 import {
   findConfig,
   formatPrewarmManifest,
-  prewarm,
   preprocessIndexPathFiles,
   resolveIndexPathFiles,
 } from "./prewarm.js";
@@ -93,15 +94,12 @@ export function getProjectDir(): string {
   return process.cwd();
 }
 
-// A fresh content DB per process, removed on exit.
-const storageRoot = mkdtempSync(join(tmpdir(), "ctxmode-"));
-process.on("exit", () => {
-  if (_store) _store.close();
-  try { rmSync(storageRoot, { recursive: true, force: true }); } catch { /* best effort */ }
-});
+// A session DB per process, removed on exit without the close-time optimize.
+const sessionPath = startSession();
+process.on("exit", () => deleteDBFiles(sessionPath));
 
 function getStorePath(): string {
-  return join(storageRoot, "content.db");
+  return sessionPath;
 }
 
 function getStore(): ContentStore {
@@ -2634,13 +2632,10 @@ export async function serve(): Promise<void> {
   // agent sees what is already searchable without a blind probe.
   if (configResult) {
     const start = performance.now();
-    const result = prewarm(configResult.config, getStorePath(), configResult.sourceBase);
-    const elapsed = (performance.now() - start).toFixed(0);
-    process.stderr.write(
-      `[ctxmode] Pre-warmed ${result.totalChunks} chunks from ` +
-        `${result.totalSources} files in ${elapsed}ms (${getStorePath()})\n`,
-    );
-    const manifest = formatPrewarmManifest(result.sources);
+    const report = prewarmSession(configResult, getStorePath());
+    if (report.writeBackError) process.stderr.write(`[ctxmode] baseline write-back failed: ${report.writeBackError}\n`);
+    process.stderr.write(`[ctxmode] ${formatReport(report, performance.now() - start)}\n`);
+    const manifest = formatPrewarmManifest(report.sources);
     if (manifest) searchTool.update({ description: `${TOOL_DESCRIPTIONS.search}\n\n${manifest}` });
   }
 
@@ -2650,5 +2645,5 @@ export async function serve(): Promise<void> {
   process.stdin.on("end", () => process.exit(0));
 
   await server.connect(new StdioServerTransport());
-  process.stderr.write(`[ctxmode] MCP server ready [tmp=${storageRoot}]\n`);
+  process.stderr.write(`[ctxmode] MCP server ready [db=${sessionPath}]\n`);
 }
