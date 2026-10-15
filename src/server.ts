@@ -1,13 +1,13 @@
-#!/usr/bin/env node
 // Vendored from mksglu/context-mode v1.0.169 (442f1eb) src/server.ts.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { createRequire } from "node:module";
-import { existsSync, readFileSync, writeSync, rmSync, mkdtempSync, statSync, lstatSync, realpathSync } from "node:fs";
-import { join, dirname, resolve, isAbsolute } from "node:path";
-import { fileURLToPath } from "node:url";
+import { readFileSync, writeSync, rmSync, mkdtempSync, statSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { randomBytes } from "node:crypto";
 import { tmpdir, cpus } from "node:os";
 import { z } from "zod";
+import pkg from "../package.json";
 import { PolyglotExecutor } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
 import { ContentStore, type IndexResult } from "./store.js";
@@ -21,24 +21,38 @@ import {
   evaluateFilePath,
   evaluateProjectContainment,
 } from "./security.js";
-import {
-  detectRuntimes,
-  getAvailableLanguages,
-  hasBunRuntime,
-} from "./runtime.js";
+import { detectRuntimes, type Language } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { charSafePrefix } from "./truncate.js";
 import { FloodGuard } from "./search/flood-guard.js";
-const __pkg_dir = dirname(fileURLToPath(import.meta.url));
-const VERSION: string = (() => {
-  for (const rel of ["../package.json", "./package.json"]) {
-    const p = resolve(__pkg_dir, rel);
-    if (existsSync(p)) {
-      try { return JSON.parse(readFileSync(p, "utf8")).version; } catch {}
-    }
-  }
-  return "unknown";
-})();
+import {
+  findConfig,
+  formatPrewarmManifest,
+  prewarm,
+  preprocessIndexPathFiles,
+  resolveIndexPathFiles,
+} from "./prewarm.js";
+
+const TOOL_DESCRIPTIONS = {
+  execute:
+    "Run code in the upstream sandbox. Use for derivation over files, command output, or fetched data without dumping raw bytes into context. When `path` is provided, the file is exposed inside the sandbox as FILE_CONTENT.",
+  index:
+    "Store content in the searchable BM25 knowledge base. When `content` is provided, it is indexed directly. When `path` is provided, the wrapper reads files relative to the agent cwd, applies markdown preprocessing, and indexes each file as its own source.",
+  search:
+    "Search indexed content with BM25/FTS5 ranking. Use after prewarm, index, fetch_and_index, batch_execute, or batch_read. Scope with `source` when you want results from a specific label or batch.",
+  fetch_and_index:
+    "Fetch one or more URLs, convert/index the content, and make it searchable. Use when the source is remote and you want retrieval via `search` instead of pasting raw page content into context.",
+  batch_execute:
+    "Run multiple shell commands, index their outputs, and optionally query the results in the same call. Use for multi-step collection where raw command output should converge into searchable indexed content.",
+  batch_read:
+    "Read multiple files, index them, and search across their contents. " +
+    "Use instead of batch_execute when all inputs are known file paths (no shell commands needed). " +
+    "Labels are auto-derived from file paths. Returns BM25 search results plus a batch ID — " +
+    "pass the batch ID as `source` to `search` for follow-up questions scoped to exactly these files.",
+} as const;
+
+/** Config `searchReminder`: false drops the throttle warning, a string replaces it. */
+let searchReminder: false | string | undefined;
 
 // Prevent silent MCP server death from unhandled async errors.
 process.on("unhandledRejection", (err) => {
@@ -53,10 +67,9 @@ process.on("uncaughtException", (err) => {
 });
 
 const runtimes = detectRuntimes();
-const available = getAvailableLanguages(runtimes);
 export const server = new McpServer({
-  name: "context-mode",
-  version: VERSION,
+  name: "context-wrapper",
+  version: pkg.version,
 });
 
 // Register empty prompts/resources handlers so MCP clients don't get -32601 (#168).
@@ -80,14 +93,12 @@ export function getProjectDir(): string {
   return process.cwd();
 }
 
-/** Resolve a possibly-relative path against the project directory. */
-function resolveProjectPath(filePath: string): string {
-  return isAbsolute(filePath) ? filePath : resolve(getProjectDir(), filePath);
-}
-
 // A fresh content DB per process, removed on exit.
 const storageRoot = mkdtempSync(join(tmpdir(), "context-mode-"));
-process.on("exit", () => { try { rmSync(storageRoot, { recursive: true, force: true }); } catch { /* best effort */ } });
+process.on("exit", () => {
+  if (_store) _store.close();
+  try { rmSync(storageRoot, { recursive: true, force: true }); } catch { /* best effort */ }
+});
 
 function getStorePath(): string {
   return join(storageRoot, "content.db");
@@ -136,7 +147,6 @@ type ToolResult = {
  */
 function checkDenyPolicy(
   command: string,
-  toolName: string,
 ): ToolResult | null {
   try {
     const policies = readBashPolicies(getProjectDir());
@@ -163,7 +173,6 @@ function checkDenyPolicy(
 function checkNonShellDenyPolicy(
   code: string,
   language: string,
-  toolName: string,
 ): ToolResult | null {
   try {
     const commands = extractShellCommands(code, language);
@@ -188,10 +197,10 @@ function checkNonShellDenyPolicy(
 }
 
 /**
- * Issue #852 — project-boundary containment for `ctx_execute_file`.
+ * Issue #852 — project-boundary containment for `execute`.
  *
  * The harness sandbox (Claude Code, etc.) cannot inspect MCP input params, so a
- * user approving a `ctx_execute_file` call cannot see that its `path` escapes
+ * user approving a `execute` call cannot see that its `path` escapes
  * the workspace. This guard refuses a `path` that resolves outside the project
  * root (absolute escape, `../` traversal, or symlink-out), restoring the
  * boundary the host believes it is enforcing.
@@ -240,7 +249,6 @@ function checkProjectBoundary(
  */
 function checkFilePathDenyPolicy(
   filePath: string,
-  toolName: string,
 ): ToolResult | null {
   try {
     const projectDir = getProjectDir();
@@ -266,11 +274,6 @@ function checkFilePathDenyPolicy(
   return null;
 }
 
-// Build description dynamically based on detected runtimes
-const langList = available.join(", ");
-const bunNote = hasBunRuntime()
-  ? " (Bun detected — JS/TS runs 3-5x faster)"
-  : "";
 
 // ─────────────────────────────────────────────────────────
 // Helper: smart snippet extraction — returns windows around
@@ -412,7 +415,7 @@ export function formatBatchQueryResults(
 
   for (const query of queries) {
     if (outputSize > maxOutput) {
-      sections.push(`## ${query}\n(output cap reached — use ctx_search(queries: ["${query}"]) for details)\n`);
+      sections.push(`## ${query}\n(output cap reached — use search(queries: ["${query}"]) for details)\n`);
       continue;
     }
 
@@ -437,14 +440,14 @@ export function formatBatchQueryResults(
   if (scope === "global") {
     sections.push(`\n> **Scope:** Queries searched the entire persistent index (query_scope: "global").`);
   } else {
-    sections.push(`\n> **Tip:** Results are scoped to this batch only. To search across all indexed sources, use \`ctx_search(queries: [...])\` or call ctx_batch_execute with \`query_scope: "global"\`.`);
+    sections.push(`\n> **Tip:** Results are scoped to this batch only. To search across all indexed sources, use \`search(queries: [...])\` or call batch_execute with \`query_scope: "global"\`.`);
   }
 
   return sections;
 }
 
 // ─────────────────────────────────────────────────────────
-// batch_execute runner — used by ctx_batch_execute handler
+// batch_execute runner — used by batch_execute handler
 // ─────────────────────────────────────────────────────────
 
 export interface BatchCommand { label: string; command: string; }
@@ -484,8 +487,8 @@ function truncateCommandForEcho(command: string): string {
 
 
 /**
- * Per-call budget for the source-code echo prepended by `ctx_execute` and
- * `ctx_execute_file` (Issues #717 + #736). The full code always reaches the
+ * Per-call budget for the source-code echo prepended by `execute` and
+ * `execute` (Issues #717 + #736). The full code always reaches the
  * sandbox — only the echo is clipped so massive payloads don't dominate
  * the response. Multi-line preserved (unlike command echo) so the user
  * sees the actual program shape.
@@ -500,7 +503,7 @@ function truncateCodeForEcho(code: string): string {
 /**
  * Build the source-code preamble surfaced before tool stdout. Provenance
  * survives in indexed chunks (FTS5 sees the fenced block) so later
- * ctx_search hits remember what ran.
+ * search hits remember what ran.
  */
 function buildExecuteEcho(language: string, code: string, path?: string): string {
   const header = path ? `path=${path}\n` : "";
@@ -511,7 +514,7 @@ function buildExecuteEcho(language: string, code: string, path?: string): string
 function formatCommandOutput(label: string, command: string, raw: string): string {
   const output = raw || "(no output)";
   // Echo the executed command below the section heading so per-chunk
-  // indexed content retains provenance for later ctx_search hits
+  // indexed content retains provenance for later search hits
   // (Issues #717 + #736).
   const echoed = truncateCommandForEcho(command);
   return `# ${label}\n\n$ ${echoed}\n\n${output}\n`;
@@ -614,11 +617,74 @@ export async function runBatchCommands(
 }
 
 // ─────────────────────────────────────────────────────────
+// Liberal string-array params
+// ─────────────────────────────────────────────────────────
+//
+// Strict MCP clients validate tool args against the advertised JSON schema
+// before dispatch, and weak models often send array params as a JSON-encoded
+// string (queries: "[\"a\",\"b\"]"). Such params are advertised as
+// "array OR string" and normalized back to an array by coerceStringArray.
+
+function stringArrayParam(description: string, minItems?: number) {
+  const array = z.array(z.string());
+  return z
+    .union([minItems === undefined ? array : array.min(minItems), z.string()])
+    .describe(
+      `${description} Accepts either an array of strings or a JSON-encoded array string, e.g. "[\\"a\\",\\"b\\"]".`,
+    );
+}
+
+type CoerceResult =
+  | { ok: true; value: string[] }
+  | { ok: false; message: string };
+
+/**
+ * Normalize a string-array argument that may arrive as a real array, a
+ * JSON-encoded array string, or a bare single value.
+ *
+ *   ["a","b"]   → ["a","b"]
+ *   '["a","b"]' → ["a","b"]   (JSON-encoded array)
+ *   "a"         → ["a"]       (bare value lifted to a single element)
+ *   '["a"'      → error       (looks like JSON, won't parse — not masked)
+ *   ""          → error
+ */
+function coerceStringArray(val: unknown, field: string): CoerceResult {
+  if (Array.isArray(val)) {
+    if (val.every((v) => typeof v === "string")) return { ok: true, value: val };
+    return { ok: false, message: `${field} must be an array of strings.` };
+  }
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (trimmed.length === 0) {
+      return { ok: false, message: `${field} must not be empty.` };
+    }
+    // A leading "[" signals intent to pass an array; if it won't parse to
+    // string[] that's malformed input, not a single bare query.
+    if (trimmed.startsWith("[")) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed) && parsed.every((v) => typeof v === "string")) {
+          return { ok: true, value: parsed };
+        }
+      } catch {
+        /* fall through to the error below */
+      }
+      return {
+        ok: false,
+        message: `${field} looks like a JSON array but did not parse to an array of strings: ${val}`,
+      };
+    }
+    return { ok: true, value: [val] };
+  }
+  return { ok: false, message: `${field} must be an array of strings.` };
+}
+
+// ─────────────────────────────────────────────────────────
 // Tool: execute
 // ─────────────────────────────────────────────────────────
 
 server.registerTool(
-  "ctx_execute",
+  "execute",
   {
     // #852: surface code execution in the host approval prompt's title (the
     // only server-controlled field the MCP permission UI renders besides args).
@@ -630,38 +696,7 @@ server.registerTool(
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: `Run code in a sandboxed subprocess.${bunNote} Languages: ${langList}.
-
-Think-in-Code — the core philosophy: the bytes your code processes never enter your conversation memory; only what you console.log() does. Reading a 700 KB log directly means 700 KB of your remaining reasoning capacity gets spent on raw bytes. Running code over that same log in this sandbox and printing a 3 KB summary leaves you with 697 KB of capacity for the actual work.
-
-Concrete shape — analyze 47 source files without reading any of them:
-  ctx_execute(language: "javascript", code: \`
-    const fs = require('fs');
-    const files = fs.readdirSync('src').filter(f => f.endsWith('.ts'));
-    files.forEach(f => {
-      const lines = fs.readFileSync('src/'+f,'utf8').split('\\\\n').length;
-      console.log(f + ': ' + lines + ' lines');
-    });
-  \`)
-  // 47 files analyzed, 15,314 LoC summarized — output ~3.6 KB instead of 47 Read() calls = ~700 KB.
-
-WHEN:
-  - You intend to derive an answer FROM data (filter, count, aggregate, parse, compare, transform) — do the derivation in code and print only the answer
-  - Output shape or size cannot be predicted before execution (recursive finds, repo-wide greps, list endpoints, query results, log scans)
-  - You would otherwise read raw output and then mentally compute — that compute belongs here, in code, where its inputs stay out of your conversation
-  - You need to keep a long-running process alive (dev server, watcher, daemon) — pass \`background: true\` to detach on timeout instead of killing the process
-  - The output may legitimately be large but you only want recall-by-topic later — pass an \`intent\` string; outputs over ~5KB are auto-indexed into the knowledge base and only the section titles + previews come back, retrievable via ctx_search
-
-WHEN NOT:
-  - Single observational command whose entire short output you intend to consume verbatim (whoami, pwd, git status on a clean tree) — Bash is simpler
-  - File mutations (Edit/Write) or navigation (cd/ls) — Bash is the right surface
-  - You already know the output is one short fixed line and you want to read it as-is
-
-RETURNS:
-  Only what your code prints. Wrap risky calls in try/catch — uncaught errors go to stderr and may leak more than intended. When \`intent\` is set and output exceeds the auto-index threshold, the response carries searchable section titles + previews instead of the raw stdout; use ctx_search(queries: [...]) to drill into specific sections.
-
-EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_process').execSync('npm test', {encoding:'utf8', stdio:['ignore','pipe','pipe']}); console.log(out.split('\\\\n').filter(l => /(FAIL|✗|×|Error:|Tests +.*(failed|passed))/i.test(l)).slice(0, 60).join('\\\\n'))")
-EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_process').execSync('gh issue list --json number,title --limit 100', {encoding:'utf8'}); const hooks = JSON.parse(out).filter(i => /hook|routing/i.test(i.title)); console.log(\`\${hooks.length} hook-related issues\`)")`,
+    description: TOOL_DESCRIPTIONS.execute,
     inputSchema: z.object({
       language: z
         .enum([
@@ -689,7 +724,7 @@ EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_p
         .preprocess(coerceBoolean, z.boolean())
         .optional()
         .default(false)
-        .describe("Keep process running after timeout (for servers/daemons). Returns partial output without killing the process. IMPORTANT: Do NOT add setTimeout/self-close timers in background scripts — the process must stay alive until the timeout detaches it. For server+fetch patterns, prefer putting both server and fetch in ONE ctx_execute call instead of using background."),
+        .describe("Keep process running after timeout (for servers/daemons). Returns partial output without killing the process. IMPORTANT: Do NOT add setTimeout/self-close timers in background scripts — the process must stay alive until the timeout detaches it. For server+fetch patterns, prefer putting both server and fetch in ONE execute call instead of using background."),
       cwd: z
         .string()
         .optional()
@@ -700,18 +735,24 @@ EXAMPLE: ctx_execute(language: "javascript", code: "const out = require('child_p
         .describe(
           "What you're looking for in the output. When provided and output is large (>5KB), " +
           "indexes output into knowledge base and returns section titles + previews — not full content. " +
-          "Use ctx_search(queries: [...]) to retrieve specific sections. Example: 'failing tests', 'HTTP 500 errors'." +
+          "Use search(queries: [...]) to retrieve specific sections. Example: 'failing tests', 'HTTP 500 errors'." +
           "\n\nTIP: Use specific technical terms, not just concepts. Check 'Searchable terms' in the response for available vocabulary.",
         ),
+      path: z
+        .string()
+        .optional()
+        .describe("Absolute file path or relative to project root"),
     }),
   },
-  async ({ language, code, timeout, background, cwd, intent }) => {
+  async ({ language, code, timeout, background, cwd, intent, path }) => {
+    if (path !== undefined) return executeFile({ path, language, code, timeout, intent });
+
     // Security: deny-only firewall
     if (language === "shell") {
-      const denied = checkDenyPolicy(code, "execute");
+      const denied = checkDenyPolicy(code);
       if (denied) return denied;
     } else {
-      const denied = checkNonShellDenyPolicy(code, language, "execute");
+      const denied = checkNonShellDenyPolicy(code, language);
       if (denied) return denied;
     }
 
@@ -853,7 +894,7 @@ function indexStdout(
     content: [
       {
         type: "text" as const,
-        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
+        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}\nUse search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
       },
     ],
   };
@@ -875,7 +916,7 @@ function intentSearch(
   const totalLines = stdout.split("\n").length;
   const totalBytes = Buffer.byteLength(stdout);
 
-  // Index into the PERSISTENT store so user can ctx_search() later
+  // Index into the PERSISTENT store so user can search() later
   const persistent = getStore();
   const indexed = persistent.indexPlainText(stdout, source);
 
@@ -895,7 +936,7 @@ function intentSearch(
       lines.push(`Searchable terms: ${distinctiveTerms.join(", ")}`);
     }
     lines.push("");
-    lines.push("Use ctx_search(queries: [...]) to explore the indexed content.");
+    lines.push("Use search(queries: [...]) to explore the indexed content.");
     return lines.join("\n");
   }
 
@@ -917,200 +958,141 @@ function intentSearch(
   }
 
   lines.push("");
-  lines.push("Use ctx_search(queries: [...]) to retrieve full content of any section.");
+  lines.push("Use search(queries: [...]) to retrieve full content of any section.");
 
   return lines.join("\n");
 }
 
 // ─────────────────────────────────────────────────────────
-// Tool: execute_file
+// execute with `path`: run code over a file
 // ─────────────────────────────────────────────────────────
 
-server.registerTool(
-  "ctx_execute_file",
-  {
-    // #852: the host's MCP approval prompt renders only the tool name/title +
-    // raw args — the title is the one server-controlled signal, so make it
-    // unambiguously announce code execution + file read for the reviewer.
-    title: "Run code over a file (executes code, reads the given path)",
-    // #846: runs arbitrary code over a file in a sandbox with full network access.
-    annotations: {
-      readOnlyHint: false,
-      destructiveHint: true,
-      idempotentHint: false,
-      openWorldHint: true,
-    },
-    description: `Read a file into a sandboxed FILE_CONTENT variable and run code over it. Only what you console.log() enters your conversation — the file bytes stay in the sandbox.
+async function executeFile({ path, language, code, timeout, intent }: {
+  path: string;
+  language: Language;
+  code: string;
+  timeout?: number;
+  intent?: string;
+}): Promise<ToolResult> {
+  // Security (#852): confine the processed file to the project root so
+  // execute cannot be used to escape the host's sandbox/permission
+  // controls. Runs before the deny-glob check — boundary first, then policy.
+  const boundaryDenied = checkProjectBoundary(path, "execute");
+  if (boundaryDenied) return boundaryDenied;
 
-Think-in-Code applied to file-level analysis: Reading the whole file means every byte enters your conversation memory and costs reasoning capacity for the rest of the session. Running code over it here lets you keep the raw bytes out and only the derived answer in. Same principle as ctx_execute, scoped to one named file via the FILE_CONTENT variable.
+  // Security: check file path against Read deny patterns
+  const pathDenied = checkFilePathDenyPolicy(path);
+  if (pathDenied) return pathDenied;
 
-WHEN:
-  - You want to KNOW SOMETHING ABOUT a file (line count, matches of a pattern, parsed structure, statistical aggregate) without needing to SEE all of it
-  - The file is structured (CSV, JSON, log, code) and a code-level derivation is cheaper than reading verbatim
-  - The file is large enough that reading the full content would burn meaningful conversation memory you need for the actual work
-  - The derivation may itself produce a large output you want recall-by-topic on later — pass an \`intent\` string; outputs over ~5KB are auto-indexed and only matching sections come back, retrievable via ctx_search
+  // Security: check code parameter against Bash deny patterns
+  if (language === "shell") {
+    const codeDenied = checkDenyPolicy(code);
+    if (codeDenied) return codeDenied;
+  } else {
+    const codeDenied = checkNonShellDenyPolicy(code, language);
+    if (codeDenied) return codeDenied;
+  }
 
-WHEN NOT:
-  - You intend to EDIT the file — use Read so the subsequent Edit can match the exact text
-  - You only need one specific line and you know its offset — Read with offset/limit is the simplest path
-  - The file is small AND you will consume all of it for understanding/editing — Read directly
+  try {
+    const effTimeout = timeout;
+    const result = await executor.executeFile({
+      path,
+      language,
+      code,
+      timeout: effTimeout,
+    });
 
-RETURNS:
-  Only what your code prints. The FILE_CONTENT variable holds the raw bytes inside the sandbox; nothing else leaves. When \`intent\` is set and output exceeds the auto-index threshold, the response carries searchable section titles + previews instead of the raw stdout.
+    // Echo path + executed source code before stdout for audit/debug
+    // (Issues #717 + #736).
+    const echo = buildExecuteEcho(language, code, path);
 
-EXAMPLE: ctx_execute_file(path: "huge.log", language: "javascript", code: "const errs = FILE_CONTENT.split('\\\\n').filter(l => /ERROR|FATAL/.test(l)); console.log(\`\${errs.length} error lines\`); console.log(errs.slice(-5).join('\\\\n'))")
-EXAMPLE: ctx_execute_file(path: "data.csv", language: "javascript", code: "const rows = FILE_CONTENT.split('\\\\n'); console.log(\`rows: \${rows.length - 1}, header: \${rows[0]}\`)")`,
-    inputSchema: z.object({
-      path: z
-        .string()
-        .describe("Absolute file path or relative to project root"),
-      language: z
-        .enum([
-          "javascript",
-          "typescript",
-          "python",
-          "shell",
-        ])
-        .describe("Runtime language"),
-      code: z
-        .string()
-        .describe(
-          "Code to process FILE_CONTENT. Print summary via console.log/print/echo.",
-        ),
-      timeout: z
-        .coerce.number()
-        .optional()
-        .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs."),
-      intent: z
-        .string()
-        .optional()
-        .describe(
-          "What you're looking for in the output. When provided and output is large (>5KB), " +
-          "returns only matching sections via BM25 search instead of truncated output.",
-        ),
-    }),
-  },
-  async ({ path, language, code, timeout, intent }) => {
-    // Security (#852): confine the processed file to the project root so
-    // ctx_execute_file cannot be used to escape the host's sandbox/permission
-    // controls. Runs before the deny-glob check — boundary first, then policy.
-    const boundaryDenied = checkProjectBoundary(path, "ctx_execute_file");
-    if (boundaryDenied) return boundaryDenied;
-
-    // Security: check file path against Read deny patterns
-    const pathDenied = checkFilePathDenyPolicy(path, "ctx_execute_file");
-    if (pathDenied) return pathDenied;
-
-    // Security: check code parameter against Bash deny patterns
-    if (language === "shell") {
-      const codeDenied = checkDenyPolicy(code, "execute_file");
-      if (codeDenied) return codeDenied;
-    } else {
-      const codeDenied = checkNonShellDenyPolicy(code, language, "execute_file");
-      if (codeDenied) return codeDenied;
-    }
-
-    try {
-      const effTimeout = timeout;
-      const result = await executor.executeFile({
-        path,
-        language,
-        code,
-        timeout: effTimeout,
-      });
-
-      // Echo path + executed source code before stdout for audit/debug
-      // (Issues #717 + #736).
-      const echo = buildExecuteEcho(language, code, path);
-
-      if (result.timedOut) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${echo}Timed out processing ${path} after ${effTimeout}ms`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      if (result.exitCode !== 0) {
-        const { isError, output } = classifyNonZeroExit({
-          language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
-        });
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          return {
-            content: [
-              { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`)}` },
-            ],
-            isError,
-          };
-        }
-        // Auto-index large error output into FTS5 — no data loss
-        if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          return {
-            content: [
-              { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`)}` },
-            ],
-            isError,
-          };
-        }
-        return {
-          content: [
-            { type: "text" as const, text: `${echo}${output}` },
-          ],
-          isError,
-        };
-      }
-
-      const stdout = result.stdout || "(no output)";
-
-      if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        return {
-          content: [
-            { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `file:${path}`)}` },
-          ],
-        };
-      }
-
-      // Auto-index large stdout into FTS5 — return pointer, not raw content
-      if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-        const indexed = indexStdout(stdout, `file:${path}`);
-        const echoed = {
-          ...indexed,
-          content: indexed.content.map((c, i) =>
-            i === 0 && c.type === "text"
-              ? { ...c, text: `${echo}${(c as { text: string }).text}` }
-              : c,
-          ),
-        };
-        return echoed;
-      }
-
+    if (result.timedOut) {
       return {
         content: [
-          { type: "text" as const, text: `${echo}${stdout}` },
-        ],
-      };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        content: [
-          { type: "text" as const, text: `Runtime error: ${message}` },
+          {
+            type: "text" as const,
+            text: `${echo}Timed out processing ${path} after ${effTimeout}ms`,
+          },
         ],
         isError: true,
       };
     }
-  },
-);
+
+    if (result.exitCode !== 0) {
+      const { isError, output } = classifyNonZeroExit({
+        language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
+      });
+      if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
+        return {
+          content: [
+            { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`)}` },
+          ],
+          isError,
+        };
+      }
+      // Auto-index large error output into FTS5 — no data loss
+      if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
+        return {
+          content: [
+            { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`)}` },
+          ],
+          isError,
+        };
+      }
+      return {
+        content: [
+          { type: "text" as const, text: `${echo}${output}` },
+        ],
+        isError,
+      };
+    }
+
+    const stdout = result.stdout || "(no output)";
+
+    if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
+      return {
+        content: [
+          { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `file:${path}`)}` },
+        ],
+      };
+    }
+
+    // Auto-index large stdout into FTS5 — return pointer, not raw content
+    if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
+      const indexed = indexStdout(stdout, `file:${path}`);
+      const echoed = {
+        ...indexed,
+        content: indexed.content.map((c, i) =>
+          i === 0 && c.type === "text"
+            ? { ...c, text: `${echo}${(c as { text: string }).text}` }
+            : c,
+        ),
+      };
+      return echoed;
+    }
+
+    return {
+      content: [
+        { type: "text" as const, text: `${echo}${stdout}` },
+      ],
+    };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      content: [
+        { type: "text" as const, text: `Runtime error: ${message}` },
+      ],
+      isError: true,
+    };
+  }
+}
 
 // ─────────────────────────────────────────────────────────
 // Tool: index
 // ─────────────────────────────────────────────────────────
 
 server.registerTool(
-  "ctx_index",
+  "index",
   {
     title: "Index Content",
     // #846: writes content into the local FTS5 store (additive, not destructive;
@@ -1121,48 +1103,44 @@ server.registerTool(
       idempotentHint: false,
       openWorldHint: false,
     },
-    description: `Store content in a searchable knowledge base (BM25 over FTS5). Splits markdown by headings, keeps code blocks intact, and persists the raw chunks. The full content stays in storage — retrieve any section on-demand via ctx_search; nothing is summarized or truncated.
-
-WHEN:
-  - Documentation from Context7, Skills, or MCP tools (API docs, framework guides, code examples)
-  - API references (endpoint details, parameter specs, response schemas)
-  - MCP tools/list output (exact tool signatures and descriptions)
-  - Skill prompts and instructions that are too large to keep verbatim in conversation
-  - README files, migration guides, changelog entries
-  - Any content with code examples you may need to reference precisely later
-
-WHEN NOT:
-  - Log files, test output, CSV, or build output — use ctx_execute_file, which processes in-sandbox without persisting bytes
-  - Single-use ephemeral content you will not query later — keep it inline if it fits, or ctx_execute_file it
-
-RETURNS:
-  Indexing metadata: chunk counts (total, code-bearing), source label, and the exact ctx_search call shape to query the indexed content. Raw content is NOT echoed back — it lives in storage, retrievable via ctx_search(source: "<label>"). When \`path\` is provided, a content hash is stored so ctx_search results auto-flag staleness on future calls.
-
-EXAMPLE: ctx_index(content: "# React useEffect\\n\\nThe Effect Hook lets you ...", source: "react-useeffect-docs")
-EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
+    description: TOOL_DESCRIPTIONS.index,
     inputSchema: z.object({
       content: z
         .string()
         .optional()
-        .describe(
-          "Raw text/markdown to index. Provide this OR path, not both.",
-        ),
+        .describe("Raw text/markdown to index. Provide this OR path, not both."),
       path: z
         .string()
         .optional()
-        .describe(
-          "File path to read and index (content never enters context). Provide this OR content.",
-        ),
+        .describe("File or directory path to index. Relative paths resolve from the current working directory/worktree."),
       source: z
         .string()
         .optional()
-        .describe(
-          "Label for the indexed content (e.g., 'Context7: React useEffect', 'Skill: frontend-design')",
-        ),
+        .describe('Source label. For directories, each file gets "{source}: {relative/path}". Defaults to the directory basename or resolved file path.'),
+      glob: z
+        .string()
+        .optional()
+        .describe('Directory-only filename pattern. Defaults to "*.md".'),
+      recursive: z
+        .boolean()
+        .optional()
+        .describe("Directory-only recursive walk flag. Defaults to true."),
+      stripFrontmatter: z
+        .boolean()
+        .optional()
+        .describe("Path-based indexing only. Strip YAML frontmatter before indexing. Defaults to true."),
+      prefixDates: z
+        .boolean()
+        .optional()
+        .describe("Path-based indexing only. For YYYY-MM-DD.md files, prefix ## headings with [date]. Defaults to false."),
     }),
   },
-  async ({ content, path, source }) => {
-    if (!content && !path) {
+  async ({ content, path, source, glob, recursive, stripFrontmatter, prefixDates }) => {
+    if (path !== undefined) {
+      return indexPath({ path, source, glob, recursive, stripFrontmatter, prefixDates });
+    }
+
+    if (!content) {
       return {
         content: [
           {
@@ -1174,46 +1152,15 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
       };
     }
 
-    // Apply Read deny-policy to prevent indexing sensitive files into the
-    // FTS5 store, which would otherwise be queryable via ctx_search and
-    // exfiltrate content into the model's context (issue #442). Mirrors the
-    // check ctx_execute_file already performs.
-    if (path) {
-      const pathDenied = checkFilePathDenyPolicy(path, "ctx_index");
-      if (pathDenied) return pathDenied;
-    }
-
     try {
-      const resolvedPath = path ? resolveProjectPath(path) : undefined;
-
-      // Symlink defense: the deny-glob check above ran on the user-supplied
-      // `path`. If `path` is a symlink whose target lands in a sensitive
-      // location, re-apply the deny check against the realpath.
-      if (resolvedPath && existsSync(resolvedPath)) {
-        const lst = lstatSync(resolvedPath);
-        if (lst.isSymbolicLink()) {
-          let realTarget: string;
-          try {
-            realTarget = realpathSync(resolvedPath);
-          } catch {
-            return {
-              content: [{ type: "text" as const, text: "Error: symlink target could not be resolved." }],
-            };
-          }
-          if (realTarget !== resolvedPath) {
-            const realDenied = checkFilePathDenyPolicy(realTarget, "ctx_index");
-            if (realDenied) return realDenied;
-          }
-        }
-      }
       const store = getStore();
-      const result = store.index({ content, path: resolvedPath, source: source ?? resolvedPath });
+      const result = store.index({ content, source });
 
       return {
         content: [
           {
             type: "text" as const,
-            text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}\nUse ctx_search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
+            text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}\nUse search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
           },
         ],
       };
@@ -1228,6 +1175,77 @@ EXAMPLE: ctx_index(path: "/path/to/large-spec.md", source: "openapi-v2-spec")`,
     }
   },
 );
+
+/**
+ * Index a file, or every glob-matched file under a directory, each as its own
+ * source after markdown preprocessing. Relative paths resolve against the
+ * project dir; files matching a Read deny rule are skipped and reported.
+ */
+function indexPath(args: {
+  path: string;
+  source?: string;
+  glob?: string;
+  recursive?: boolean;
+  stripFrontmatter?: boolean;
+  prefixDates?: boolean;
+}): ToolResult {
+  let resolved;
+  try {
+    resolved = resolveIndexPathFiles({ ...args, path: resolve(getProjectDir(), args.path) });
+  } catch (err: any) {
+    return {
+      content: [{ type: "text" as const, text: `Index error: ${err.message}` }],
+      isError: true,
+    };
+  }
+
+  if (resolved.files.length === 0) {
+    return {
+      content: [{
+        type: "text" as const,
+        text: resolved.isDirectory
+          ? `No files matched in ${resolved.basePath}.`
+          : `Nothing indexable found at ${resolved.basePath}.`,
+      }],
+    };
+  }
+
+  const prepared = preprocessIndexPathFiles(resolved.files, args);
+  const store = getStore();
+  let indexed = 0;
+  let totalChunks = 0;
+  const errors: string[] = [];
+
+  for (const entry of prepared) {
+    if (checkFilePathDenyPolicy(entry.file.path)) {
+      errors.push(`${entry.file.name}: blocked by Read deny policy`);
+      continue;
+    }
+    const source = resolved.isDirectory
+      ? `${resolved.sourcePrefix}: ${entry.source}`
+      : args.source ?? resolved.basePath;
+    try {
+      totalChunks += store.index({ content: entry.content, source }).totalChunks;
+      indexed++;
+    } catch (err: any) {
+      errors.push(`${entry.file.name}: ${err.message}`);
+    }
+  }
+
+  const summary = resolved.isDirectory
+    ? `Indexed ${indexed} file${indexed === 1 ? "" : "s"} (${totalChunks} chunks) from ${resolved.basePath}`
+    : `Indexed ${totalChunks} sections from: ${args.source ?? resolved.basePath}`;
+
+  return {
+    content: [{
+      type: "text" as const,
+      text: errors.length > 0
+        ? `${summary}\n\nErrors (${errors.length}):\n${errors.join("\n")}`
+        : summary,
+    }],
+    isError: errors.length > 0 && indexed === 0,
+  };
+}
 
 // ─────────────────────────────────────────────────────────
 // Tool: search — progressive throttling
@@ -1322,8 +1340,8 @@ function coerceCommandsArray(val: unknown): unknown {
   return arr;
 }
 
-server.registerTool(
-  "ctx_search",
+const searchTool = server.registerTool(
+  "search",
   {
     title: "Search Indexed Content",
     // #846: read-only query over the local FTS5 store. No mutation, no network.
@@ -1333,33 +1351,9 @@ server.registerTool(
       idempotentHint: true,
       openWorldHint: false,
     },
-    description: `Search a unified knowledge base with a multi-strategy ranking pipeline. Two parallel matchers run on every query: a Porter-stemming matcher ("caching" finds "cached", "caches", "cach") and a trigram-substring matcher ("useEff" finds "useEffect"). Their ranked lists are merged via Reciprocal Rank Fusion, so a document that ranks well in both surfaces above one that wins only on a single strategy. Multi-term queries get an additional proximity-rerank pass that boosts passages where the query terms appear close together. Typos are corrected via Levenshtein distance and re-searched. Result snippets are window-extracted around the matched terms, not blindly truncated.
-
-The knowledge base is unified: queries reach indexed content you stored (ctx_index, ctx_fetch_and_index, ctx_batch_execute output) AND auto-captured session memory written by hooks (decisions, errors, blockers, plans, user prompts, rejected approaches, tool failures, compaction guides — 26 event categories). File-backed sources carry a content hash and auto-flag staleness when the source file changes.
-
-WHEN:
-  - You want to recall something that exists in storage (recently indexed content, prior session events, auto-memory) instead of re-reading raw sources
-  - You have multiple related questions about the same body of knowledge — batch every question into one call (the ranking pipeline runs per-query but the round-trip cost is paid once)
-  - You want to scope the query to one labelled source (pass \`source\` — partial match is fine)
-  - You want a chronological view across current session + prior sessions + persistent auto-memory (pass \`sort: "timeline"\` — the default \`relevance\` mode only ranks within the current session)
-  - You want to filter ranked results by content shape (pass \`contentType: "code"\` to surface implementation snippets or \`contentType: "prose"\` to surface explanations)
-
-WHEN NOT:
-  - The data you want to query has never been stored in the knowledge base AND no session memory has accumulated around it — capture first (run a gather-and-index call), then come back here to query
-  - You have one ad-hoc question against data that is not in the knowledge base — answer it inline by running code in the sandbox tool; one round-trip instead of capture-then-query
-
-RETURNS:
-  Per-query ranked sections with window-extracted snippets. Use 2-4 specific technical terms per query. Common session-memory source labels: \`decision\` (user corrections / preferences), \`error\` and \`error-resolution\` (past failures + their fixes), \`blocker\`, \`plan\`, \`user-prompt\`, \`rejected-approach\`, \`compaction\` (post-compact session guide). See ctx_stats for live category counts. Each response carries a throttle counter (call #N/M in the rolling time window); results taper toward the soft cap and calls block after the hard cap. Tune via CONTEXT_MODE_SEARCH_WINDOW_MS, CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER, CONTEXT_MODE_SEARCH_BLOCK_AFTER.
-
-EXAMPLE: ctx_search(queries: ["root cause", "proposed fix", "test coverage"], source: "issue-#683")
-EXAMPLE: ctx_search(queries: ["what did we decide about caching"], source: "decision", sort: "timeline")
-EXAMPLE: ctx_search(queries: ["useEffect cleanup pattern"], source: "react-docs", contentType: "code", limit: 5)
-EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blockers"], sort: "timeline")`,
+    description: TOOL_DESCRIPTIONS.search,
     inputSchema: z.object({
-      queries: z.preprocess(coerceJsonArray, z
-        .array(z.string())
-        .optional()
-        .describe("Array of search queries. Batch ALL questions in one call.")),
+      queries: stringArrayParam("Array of search queries. Batch ALL questions in one call.").optional(),
       limit: z
         .coerce.number()
         .optional()
@@ -1375,157 +1369,168 @@ EXAMPLE: ctx_search(queries: ["last user prompt", "active skills", "open blocker
         .describe("Filter results by content type: 'code' or 'prose'."),
     }),
   },
-  async (params) => {
-    try {
-      const store = getStore();
+  (params) => runSearch(params),
+);
 
-      // Guard: redirect when the index is empty — ctx_search is a follow-up
-      // tool that requires prior indexing.
-      if (store.getStats().chunks === 0) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: "Knowledge base is empty — no content has been indexed yet.\n\n" +
-              "ctx_search is a follow-up tool that queries previously indexed content. " +
-              "To gather and index content first, use:\n" +
-              "  • ctx_batch_execute(commands, queries) — run commands, auto-index output, and search in one call\n" +
-              "  • ctx_fetch_and_index(url) — fetch a URL, index it, then search with ctx_search\n" +
-              "  • ctx_index(content, source) — manually index text content\n\n" +
-              "After indexing, ctx_search becomes available for follow-up queries.",
-          }],
-          isError: true,
-        };
-      }
-
-      const raw = params as Record<string, unknown>;
-
-      // Normalize: accept both query (string) and queries (array)
-      const queryList: string[] = [];
-      if (Array.isArray(raw.queries) && raw.queries.length > 0) {
-        queryList.push(...(raw.queries as string[]));
-      } else if (typeof raw.query === "string" && raw.query.length > 0) {
-        queryList.push(raw.query as string);
-      }
-
-      if (queryList.length === 0) {
-        return {
-          content: [{ type: "text" as const, text: "Error: provide query or queries." }],
-          isError: true,
-        };
-      }
-
-      const { limit = 3, source, contentType } = params as {
-        limit?: number;
-        source?: string;
-        contentType?: "code" | "prose";
-      };
-
-      // Progressive throttling: track calls per agent-context window (#769).
-      const now = Date.now();
-      const flood = searchFloodGuard.record("__default__", now);
-      const searchCallCount = flood.count;
-
-      // After SEARCH_BLOCK_AFTER calls (for THIS agent): refuse
-      if (flood.blocked) {
-        return {
-          content: [{
-            type: "text" as const,
-            text: `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - flood.windowStart) / 1000)}s. ` +
-              "You're flooding context. STOP making individual search calls. " +
-              "Use ctx_batch_execute(commands, queries) for your next research step.",
-          }],
-          isError: true,
-        };
-      }
-
-      // Determine per-query result limit based on throttle level
-      const effectiveLimit = flood.softCapped
-        ? 1 // after soft cap: only 1 result per query
-        : Math.min(limit, 2); // normal: max 2
-
-      const MAX_TOTAL = 40 * 1024; // 40KB total cap
-      let totalSize = 0;
-      const sections: string[] = [];
-
-      for (const q of queryList) {
-        if (totalSize > MAX_TOTAL) {
-          sections.push(`## ${q}\n(output cap reached)\n`);
-          continue;
-        }
-
-        const results = store.searchWithFallback(
-          q,
-          effectiveLimit,
-          source,
-          contentType,
-          "like",
-        );
-
-        if (results.length === 0) {
-          sections.push(`## ${q}\nNo results found.`);
-          continue;
-        }
-
-        const formatted = results
-          .map((r, i) => {
-            const origin = (r as any).origin || "current-session";
-            const ts = (r as any).timestamp ? (r as any).timestamp.slice(0, 16).replace("T", " ") : "";
-            const header = `--- [${origin}${ts ? " | " + ts : ""} | ${r.source}] ---`;
-            const heading = `### ${r.title}`;
-            const snippet = extractSnippet(r.content, q, 1500, r.highlighted);
-            return `${header}\n${heading}\n\n${snippet}`;
-          })
-          .join("\n\n");
-
-        sections.push(`## ${q}\n\n${formatted}`);
-        totalSize += formatted.length;
-      }
-
-      let output = sections.join("\n\n---\n\n");
-
-      // Report auto-refreshed stale sources
-      if (store.lastRefreshCount > 0) {
-        output = `> Auto-refreshed ${store.lastRefreshCount} stale source${store.lastRefreshCount > 1 ? "s" : ""} (file changed since indexing).\n\n` + output;
-      }
-
-      // Throttle counter — always surfaced so agents can pace themselves
-      // proactively instead of discovering the limit only after results are
-      // already truncated. Soft warning after SEARCH_MAX_RESULTS_AFTER calls;
-      // gentle informational line before that.
-      const throttleRemaining = Math.max(0, SEARCH_BLOCK_AFTER - searchCallCount);
-      const softCapRemaining = Math.max(0, SEARCH_MAX_RESULTS_AFTER - searchCallCount);
-      if (searchCallCount >= SEARCH_MAX_RESULTS_AFTER) {
-        output += `\n\n⚠ search call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
-          `Results limited to ${effectiveLimit}/query. ${throttleRemaining} call(s) remaining before block. ` +
-          `Batch queries: ctx_search(queries: ["q1","q2","q3"]) or use ctx_batch_execute.`;
-      } else {
-        output += `\n\n> Throttle: call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
-          `${softCapRemaining} call(s) before soft cap. ` +
-          `Prefer ctx_search(queries: [...]) array form for multi-query workloads — it counts as a single call.`;
-      }
-
-      if (output.trim().length === 0) {
-        const sources = store.listSources();
-        const sourceList = sources.length > 0
-          ? `\nIndexed sources: ${sources.map((s) => `"${s.label}" (${s.chunkCount} sections)`).join(", ")}`
-          : "";
-        return {
-          content: [{ type: "text" as const, text: `No results found.${sourceList}` }],
-        };
-      }
-
+async function runSearch(params: {
+  queries?: unknown;
+  limit?: number;
+  source?: string;
+  contentType?: "code" | "prose";
+}): Promise<ToolResult> {
+  let queryList: string[] = [];
+  if (params.queries !== undefined) {
+    const coerced = coerceStringArray(params.queries, "queries");
+    if (!coerced.ok) {
       return {
-        content: [{ type: "text" as const, text: output }],
-      };
-    } catch (err: unknown) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        content: [{ type: "text" as const, text: `Search error: ${message}` }],
+        content: [{ type: "text" as const, text: `Invalid arguments for search:\n  - ${coerced.message}` }],
         isError: true,
       };
     }
-  },
-);
+    queryList = coerced.value;
+  }
+
+  try {
+    const store = getStore();
+
+    // Guard: redirect when the index is empty — search is a follow-up
+    // tool that requires prior indexing.
+    if (store.getStats().chunks === 0) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: "Knowledge base is empty — no content has been indexed yet.\n\n" +
+            "search is a follow-up tool that queries previously indexed content. " +
+            "To gather and index content first, use:\n" +
+            "  • batch_execute(commands, queries) — run commands, auto-index output, and search in one call\n" +
+            "  • fetch_and_index(url) — fetch a URL, index it, then search with search\n" +
+            "  • index(content, source) — manually index text content\n\n" +
+            "After indexing, search becomes available for follow-up queries.",
+        }],
+        isError: true,
+      };
+    }
+
+    if (queryList.length === 0) {
+      return {
+        content: [{ type: "text" as const, text: "Error: provide query or queries." }],
+        isError: true,
+      };
+    }
+
+    const { limit = 3, source, contentType } = params;
+
+    // Progressive throttling: track calls per agent-context window (#769).
+    const now = Date.now();
+    const flood = searchFloodGuard.record("__default__", now);
+    const searchCallCount = flood.count;
+
+    // After SEARCH_BLOCK_AFTER calls (for THIS agent): refuse
+    if (flood.blocked) {
+      return {
+        content: [{
+          type: "text" as const,
+          text: searchReminder !== undefined
+            ? searchReminder || ""
+            : `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - flood.windowStart) / 1000)}s. ` +
+              "You're flooding context. STOP making individual search calls. " +
+              "Use batch_execute(commands, queries) for your next research step.",
+        }],
+        isError: true,
+      };
+    }
+
+    // Determine per-query result limit based on throttle level
+    const effectiveLimit = flood.softCapped
+      ? 1 // after soft cap: only 1 result per query
+      : Math.min(limit, 2); // normal: max 2
+
+    const MAX_TOTAL = 40 * 1024; // 40KB total cap
+    let totalSize = 0;
+    const sections: string[] = [];
+
+    for (const q of queryList) {
+      if (totalSize > MAX_TOTAL) {
+        sections.push(`## ${q}\n(output cap reached)\n`);
+        continue;
+      }
+
+      const results = store.searchWithFallback(
+        q,
+        effectiveLimit,
+        source,
+        contentType,
+        "like",
+      );
+
+      if (results.length === 0) {
+        sections.push(`## ${q}\nNo results found.`);
+        continue;
+      }
+
+      const formatted = results
+        .map((r, i) => {
+          const origin = (r as any).origin || "current-session";
+          const ts = (r as any).timestamp ? (r as any).timestamp.slice(0, 16).replace("T", " ") : "";
+          const header = `--- [${origin}${ts ? " | " + ts : ""} | ${r.source}] ---`;
+          const heading = `### ${r.title}`;
+          const snippet = extractSnippet(r.content, q, 1500, r.highlighted);
+          return `${header}\n${heading}\n\n${snippet}`;
+        })
+        .join("\n\n");
+
+      sections.push(`## ${q}\n\n${formatted}`);
+      totalSize += formatted.length;
+    }
+
+    let output = sections.join("\n\n---\n\n");
+
+    // Report auto-refreshed stale sources
+    if (store.lastRefreshCount > 0) {
+      output = `> Auto-refreshed ${store.lastRefreshCount} stale source${store.lastRefreshCount > 1 ? "s" : ""} (file changed since indexing).\n\n` + output;
+    }
+
+    // Throttle counter — always surfaced so agents can pace themselves
+    // proactively instead of discovering the limit only after results are
+    // already truncated. Soft warning after SEARCH_MAX_RESULTS_AFTER calls;
+    // gentle informational line before that.
+    const throttleRemaining = Math.max(0, SEARCH_BLOCK_AFTER - searchCallCount);
+    const softCapRemaining = Math.max(0, SEARCH_MAX_RESULTS_AFTER - searchCallCount);
+    if (searchCallCount >= SEARCH_MAX_RESULTS_AFTER) {
+      if (searchReminder === undefined) {
+        output += `\n\n⚠ search call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
+          `Results limited to ${effectiveLimit}/query. ${throttleRemaining} call(s) remaining before block. ` +
+          `Batch queries: search(queries: ["q1","q2","q3"]) or use batch_execute.`;
+      } else if (searchReminder !== false) {
+        output += `\n\n${searchReminder}`;
+      }
+    } else {
+      output += `\n\n> Throttle: call #${searchCallCount}/${SEARCH_BLOCK_AFTER} in this window. ` +
+        `${softCapRemaining} call(s) before soft cap. ` +
+        `Prefer search(queries: [...]) array form for multi-query workloads — it counts as a single call.`;
+    }
+
+    if (output.trim().length === 0) {
+      const sources = store.listSources();
+      const sourceList = sources.length > 0
+        ? `\nIndexed sources: ${sources.map((s) => `"${s.label}" (${s.chunkCount} sections)`).join(", ")}`
+        : "";
+      return {
+        content: [{ type: "text" as const, text: `No results found.${sourceList}` }],
+      };
+    }
+
+    return {
+      content: [{ type: "text" as const, text: output }],
+    };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      content: [{ type: "text" as const, text: `Search error: ${message}` }],
+      isError: true,
+    };
+  }
+}
 
 // ─────────────────────────────────────────────────────────
 // Turndown path resolution (external dep, like better-sqlite3)
@@ -1780,7 +1785,7 @@ async function fetchWithManualRedirect(initialUrl) {
 }
 
 // Subprocess response-body size cap. A malicious or unexpectedly large
-// endpoint reachable through ctx_fetch_and_index would otherwise stream
+// endpoint reachable through fetch_and_index would otherwise stream
 // gigabytes into resp.text(), then into outputPath, then into the parent
 // MCP server's heap via readFileSync. 50 MB is far above typical web
 // page / API response sizes (~1-5 MB) but bounded enough to keep parent
@@ -1862,7 +1867,7 @@ type FetchOneResult =
  * fetched results through `indexFetched` serially to avoid FTS5 WAL contention.
  */
 /**
- * SSRF guard for ctx_fetch_and_index: validate URL scheme + resolve target IP +
+ * SSRF guard for fetch_and_index: validate URL scheme + resolve target IP +
  * block link-local / IMDS / multicast / reserved IP ranges. Returns null if
  * safe; returns a FetchOneResult fetch_error if blocked.
  *
@@ -2106,7 +2111,7 @@ interface IndexedFetchResult {
 function indexFetched(f: { url: string; source?: string; markdown: string; header: string }): IndexedFetchResult {
   const store = getStore();
   // Storage label composed via composeFetchCacheKey so two URLs sharing a
-  // `source` label do not overwrite each other (commit 1f1243e). ctx_search()
+  // `source` label do not overwrite each other (commit 1f1243e). search()
   // still finds both via LIKE-mode source filter on the `source` substring.
   const storageLabel = composeFetchCacheKey(f.source, f.url);
   let indexed: IndexResult;
@@ -2118,7 +2123,7 @@ function indexFetched(f: { url: string; source?: string; markdown: string; heade
     indexed = store.index({ content: f.markdown, source: storageLabel });
   }
   const preview = f.markdown.length > FETCH_PREVIEW_LIMIT
-    ? charSafePrefix(f.markdown, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use ctx_search() for full content]"
+    ? charSafePrefix(f.markdown, FETCH_PREVIEW_LIMIT) + "\n\n…[truncated — use search() for full content]"
     : f.markdown;
   return {
     label: indexed.label,
@@ -2129,7 +2134,7 @@ function indexFetched(f: { url: string; source?: string; markdown: string; heade
 }
 
 server.registerTool(
-  "ctx_fetch_and_index",
+  "fetch_and_index",
   {
     title: "Fetch & Index URL(s)",
     // #846: fetches external URLs (open world) and writes them into the store.
@@ -2139,27 +2144,7 @@ server.registerTool(
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: `Fetches URL content, converts HTML to markdown (JSON is chunked by key paths, plain text indexed directly), persists it in a searchable knowledge base, and returns a small preview window per source. The raw page bytes never enter your conversation — they live in storage and you retrieve any section on-demand via ctx_search.
-
-Caching: every fetch is cached on disk and reused for repeat calls within the TTL window. The default TTL is 24 hours; override per-call with the \`ttl\` parameter (milliseconds, \`ttl: 0\` bypasses cache like \`force: true\`). Stored content older than 14 days is cleaned up on startup.
-
-WHEN:
-  - You need web content (docs, changelogs, API references, spec pages) and the raw page bytes should NOT enter your conversation
-  - Multi-URL research (library evaluation, migration scans, doc comparisons): pass the \`requests\` array and a \`concurrency\` value 2-8 for parallel I/O
-  - You want repeat lookups against the same URL to be cheap (TTL cache hits return only a hint, no re-fetch)
-  - You want a long-lived cache window (override \`ttl\` upward for stable specs) or a guaranteed-fresh fetch (\`ttl: 0\` or \`force: true\`)
-
-WHEN NOT:
-  - You already have the content locally — store it via the inline index tool
-  - The page is SPA-rendered (JavaScript-required to materialize content) — this is a plain HTTP fetch, no headless browser
-
-RETURNS:
-  Per-source preview windows extracted around indexable headings plus indexing metadata (chunk counts, source labels, cache state). Raw content is NOT echoed back — retrieve any section on-demand via ctx_search(source: "<label>"). Concurrency parallelizes the fetch phase up to your chosen value (capped by the host's logical CPU count); the FTS5 write phase always runs serially because SQLite is a single-writer store. Net latency = max(fetch latency across the pool) + sum(per-source index write time). Cache hits skip both phases and return a small freshness hint instead of re-fetching. Use 4-8 for stable I/O-bound batches; lower the value when the target host enforces a per-IP rate limit you cannot raise.
-
-EXAMPLE: ctx_fetch_and_index(
-  requests: [{url: "https://react.dev/...", source: "react"}, {url: "https://vuejs.org/...", source: "vue"}],
-  concurrency: 5
-)`,
+    description: TOOL_DESCRIPTIONS.fetch_and_index,
     inputSchema: z.object({
       url: z.string().optional().describe("Single URL to fetch and index (legacy single-shape)"),
       source: z
@@ -2224,7 +2209,7 @@ EXAMPLE: ctx_fetch_and_index(
       return {
         content: [{
           type: "text" as const,
-          text: "ctx_fetch_and_index requires either `url` (single) or `requests: [{url, source?}, ...]` (batch).",
+          text: "fetch_and_index requires either `url` (single) or `requests: [{url, source?}, ...]` (batch).",
         }],
         isError: true,
       };
@@ -2276,7 +2261,7 @@ EXAMPLE: ctx_fetch_and_index(
         return {
           content: [{
             type: "text" as const,
-            text: `Cached: **${r.label}** — ${r.chunkCount} sections, indexed ${r.ageStr} (fresh, TTL: ${r.ttlStr}).\nTo refresh: call ctx_fetch_and_index again with \`force: true\`.\n\nYou MUST call ctx_search() to answer questions about this content — this cached response contains no content.\nUse: ctx_search(queries: [...], source: "${r.label}")`,
+            text: `Cached: **${r.label}** — ${r.chunkCount} sections, indexed ${r.ageStr} (fresh, TTL: ${r.ttlStr}).\nTo refresh: call fetch_and_index again with \`force: true\`.\n\nYou MUST call search() to answer questions about this content — this cached response contains no content.\nUse: search(queries: [...], source: "${r.label}")`,
           }],
         };
       }
@@ -2284,7 +2269,7 @@ EXAMPLE: ctx_fetch_and_index(
         const totalKB = (r.indexed.totalBytes / 1024).toFixed(1);
         const text = [
           `Fetched and indexed **${r.indexed.totalChunks} sections** (${totalKB}KB) from: ${r.indexed.label}`,
-          `Full content indexed in sandbox — use ctx_search(queries: [...], source: "${r.indexed.label}") for specific lookups.`,
+          `Full content indexed in sandbox — use search(queries: [...], source: "${r.indexed.label}") for specific lookups.`,
           "",
           "---",
           "",
@@ -2361,7 +2346,7 @@ EXAMPLE: ctx_fetch_and_index(
       "",
       ...lines,
       "",
-      `ctx_search(queries: [...], source: "<label>") for full content.`,
+      `search(queries: [...], source: "<label>") for full content.`,
       ...(snippets.length > 0 ? ["", "---", "", ...snippets] : []),
     ].join("\n");
 
@@ -2377,7 +2362,7 @@ EXAMPLE: ctx_fetch_and_index(
 // ─────────────────────────────────────────────────────────
 
 server.registerTool(
-  "ctx_batch_execute",
+  "batch_execute",
   {
     title: "Batch Execute & Search",
     // #846: runs arbitrary shell commands (with network) and indexes output.
@@ -2387,32 +2372,7 @@ server.registerTool(
       idempotentHint: false,
       openWorldHint: true,
     },
-    description: `Run multiple commands in ONE call. Every command's output is auto-indexed into the knowledge base; if you also pass \`queries\`, the matching sections come back in the same round trip so a follow-up search call is not needed.
-
-Concurrency parallelizes the FETCH phase (run-the-commands). The DERIVATION phase — turning raw output into an answer — still belongs in code: add a processing command that consumes the indexed output and prints only the answer, so the raw bytes never enter your conversation (Think-in-Code, same principle as the sandbox tool).
-
-WHEN:
-  - You have 3+ related commands you would otherwise run sequentially (multi-issue lookups, git log + git diff + git blame, multi-file reads, multi-region cloud queries)
-  - You want to gather AND query in one round trip — pass \`queries\` so the matching sections come back inline
-  - You want to parallelize I/O-bound work — pass \`concurrency\` 2-8 (network calls, gh CLI, cloud APIs, multi-repo git reads)
-  - The combined output is large enough that piping it through ctx_search later would itself be expensive — let auto-index + inline queries do both in one shot
-
-WHEN NOT:
-  - Single command with no follow-up query — run it in the sandbox tool directly
-  - CPU-bound or stateful commands — keep concurrency at 1 (npm test, build, lint, port-binding servers, lock-file holders, anything that races on the same resource)
-
-RETURNS:
-  Auto-indexed section list per command label, plus top matches per query (when \`queries\` is passed). Raw output is NOT echoed in full — only the matched windows. Concurrency>1 switches each command to its own per-command timeout (no shared budget); concurrency=1 preserves the legacy shared-budget cascading-skip-on-timeout path. Use 4-8 for I/O-bound batches; keep at 1 for CPU work or shared-state commands; lower the value when target hosts enforce per-IP rate limits.
-
-EXAMPLE: ctx_batch_execute(
-  commands: [
-    {label: "issue 1", command: "gh issue view 1"},
-    {label: "issue 2", command: "gh issue view 2"},
-    {label: "summarize", command: "echo done"}
-  ],
-  queries: ["root cause", "proposed fix"],
-  concurrency: 2
-)`,
+    description: TOOL_DESCRIPTIONS.batch_execute,
     inputSchema: z.object({
       commands: z.preprocess(coerceCommandsArray, z
         .array(
@@ -2470,7 +2430,7 @@ EXAMPLE: ctx_batch_execute(
           "Scope for `queries` (default: `batch`). " +
           "`batch` searches ONLY the chunks produced by this batch's commands " +
           "— useful when you want answers about the just-fetched output. " +
-          "`global` searches the entire persistent index (same scope as ctx_search) " +
+          "`global` searches the entire persistent index (same scope as search) " +
           "— useful when you want the batch commands to enrich context and " +
           "the queries to also surface related prior knowledge in one round trip.",
         ),
@@ -2479,7 +2439,7 @@ EXAMPLE: ctx_batch_execute(
   async ({ commands, queries, timeout, concurrency, cwd, query_scope }) => {
     // Security: check each command against deny patterns
     for (const cmd of commands) {
-      const denied = checkDenyPolicy(cmd.command, "batch_execute");
+      const denied = checkDenyPolicy(cmd.command);
       if (denied) return denied;
     }
 
@@ -2543,7 +2503,7 @@ EXAMPLE: ctx_batch_execute(
       // Run all search queries — default scope is batch-local (legacy behavior).
       // When the caller passes query_scope: "global", searches reach the entire
       // persistent index in the same round trip. Cross-source search remains
-      // available via explicit ctx_search() as well.
+      // available via explicit search() as well.
       const queryResults = formatBatchQueryResults(store, queries, source, undefined, query_scope);
 
       // Get searchable terms for edge cases where follow-up is needed
@@ -2584,24 +2544,136 @@ EXAMPLE: ctx_batch_execute(
 );
 
 // ─────────────────────────────────────────────────────────
+// Tool: batch_read
+// ─────────────────────────────────────────────────────────
+
+const ANCHOR_DIRS = new Set(["apps", "packages", "src", "lib"]);
+
+function deriveLabel(filePath: string): string {
+  const segments = filePath.split("/").filter(Boolean);
+
+  let anchorIdx = -1;
+  for (let i = segments.length - 1; i >= 0; i--) {
+    if (ANCHOR_DIRS.has(segments[i])) {
+      anchorIdx = i;
+      break;
+    }
+  }
+
+  // Take everything after the last anchor dir; fall back to last two segments
+  let relevant = anchorIdx >= 0 ? segments.slice(anchorIdx + 1) : segments.slice(-2);
+
+  // Collapse intermediate 'src/' segments that add noise
+  relevant = relevant.filter((s) => s !== "src");
+
+  return relevant.join("/");
+}
+
+/** First occurrence keeps the clean label; subsequent duplicates get (2), (3), … */
+function deduplicateLabels(labels: string[]): string[] {
+  const seen = new Map<string, number>();
+  return labels.map((label) => {
+    const n = (seen.get(label) ?? 0) + 1;
+    seen.set(label, n);
+    return n > 1 ? `${label} (${n})` : label;
+  });
+}
+
+server.registerTool(
+  "batch_read",
+  {
+    description: TOOL_DESCRIPTIONS.batch_read,
+    inputSchema: z.object({
+      files: stringArrayParam(
+        "File paths to read and index. Absolute paths preferred; " +
+        "relative paths resolve from the current working directory.",
+        1,
+      ),
+      queries: stringArrayParam(
+        "Search queries to run against the indexed content. Use 5–8 comprehensive queries. " +
+        "Each returns top matching sections.",
+        1,
+      ),
+    }),
+  },
+  async (args) => {
+    const filesC = coerceStringArray(args.files, "files");
+    const queriesC = coerceStringArray(args.queries, "queries");
+    if (!filesC.ok || !queriesC.ok) {
+      const argErrors = [filesC, queriesC].flatMap((c) => (c.ok ? [] : [c.message]));
+      return {
+        content: [{
+          type: "text" as const,
+          text: `Invalid arguments for batch_read:\n${argErrors.map((m) => `  - ${m}`).join("\n")}`,
+        }],
+        isError: true,
+      };
+    }
+    const files = filesC.value;
+
+    const batchId = randomBytes(3).toString("hex");
+    const labels = deduplicateLabels(files.map((f) => deriveLabel(resolve(getProjectDir(), f))));
+
+    const store = getStore();
+    const skipped: string[] = [];
+    for (let i = 0; i < files.length; i++) {
+      const filePath = resolve(getProjectDir(), files[i]);
+      let content: string;
+      try {
+        content = readFileSync(filePath, "utf-8");
+      } catch {
+        skipped.push(filePath);
+        continue;
+      }
+      store.index({ content, source: `${batchId}/${labels[i]}` });
+    }
+
+    const searchResult = await runSearch({ queries: queriesC.value, source: batchId, limit: 3 });
+    const searchText = searchResult.content[0]?.text ?? "(no results)";
+
+    const errorNote =
+      skipped.length > 0
+        ? `\n\n⚠ Could not read ${skipped.length} file(s):\n${skipped.map((f) => `  - ${f}`).join("\n")}`
+        : "";
+
+    const followUpNote =
+      `\n\n---\n**Batch ID:** \`${batchId}\`\n` +
+      `To search only these files: \`search(queries: [...], source: "${batchId}")\``;
+
+    return {
+      content: [{ type: "text" as const, text: searchText + errorNote + followUpNote }],
+    };
+  },
+);
+
+// ─────────────────────────────────────────────────────────
 // Server startup
 // ─────────────────────────────────────────────────────────
 
-async function main() {
-  const shutdown = () => {
-    executor.cleanupBackgrounded();
-    if (_store) _store.close();
-  };
-  process.on("exit", shutdown);
+/** Pre-warm the configured sources, then serve MCP over stdio. */
+export async function serve(): Promise<void> {
+  const configResult = findConfig(getProjectDir());
+  searchReminder = configResult?.config.searchReminder;
+
+  // Fold the pre-warmed corpus manifest into the search description so the
+  // agent sees what is already searchable without a blind probe.
+  if (configResult) {
+    const start = performance.now();
+    const result = prewarm(configResult.config, getStorePath(), configResult.sourceBase);
+    const elapsed = (performance.now() - start).toFixed(0);
+    process.stderr.write(
+      `[context-wrapper] Pre-warmed ${result.totalChunks} chunks from ` +
+        `${result.totalSources} files in ${elapsed}ms (${getStorePath()})\n`,
+    );
+    const manifest = formatPrewarmManifest(result.sources);
+    if (manifest) searchTool.update({ description: `${TOOL_DESCRIPTIONS.search}\n\n${manifest}` });
+  }
+
+  process.on("exit", () => executor.cleanupBackgrounded());
   process.on("SIGINT", () => process.exit(0));
   process.on("SIGTERM", () => process.exit(0));
   process.stdin.on("end", () => process.exit(0));
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await server.connect(new StdioServerTransport());
+  process.stderr.write(`[context-wrapper] MCP server ready [tmp=${storageRoot}]\n`);
 }
-
-main().catch((err) => {
-  console.error("Fatal:", err);
-  process.exit(1);
-});

@@ -1,7 +1,7 @@
 // Golden parity harness: drives an MCP server over stdio against a synthetic
 // corpus and records (or checks) a normalized transcript of its answers.
 //
-//   bun test/golden/run.ts --record -- node wrapper.bundle.mjs
+//   bun test/golden/run.ts --record -- bun src/main.ts
 //   bun test/golden/run.ts --check [--strict] -- <cmd...>
 //
 // --strict ignores expected-differences.json, so every section must match.
@@ -231,14 +231,17 @@ async function record(cmd: string[]): Promise<Transcript> {
   return out;
 }
 
+// An entry without `rewrite` skips its steps; with `rewrite`, its [from, to]
+// pairs are applied to the expected text and the step must then match exactly.
 interface ExpectedDifference {
   key: string;
   reason: string;
+  rewrite?: Array<[string, string]>;
 }
 
-// A key names a whole section ("timeline") or one step ("tools.search.manifest").
-function skipped(section: string, step: string, list: ExpectedDifference[]): ExpectedDifference | undefined {
-  return list.find((d) => d.key === section || d.key === `${section}.${step}`);
+// A key names every step ("*"), a whole section ("timeline") or one step ("tools.search.manifest").
+function matching(section: string, step: string, list: ExpectedDifference[]): ExpectedDifference[] {
+  return list.filter((d) => d.key === "*" || d.key === section || d.key === `${section}.${step}`);
 }
 
 function lineDiff(a: string, b: string, context = 2, max = 12): string {
@@ -259,10 +262,12 @@ function check(expected: Transcript, actual: Transcript, list: ExpectedDifferenc
   for (const section of sections) {
     const steps = [...new Set([...Object.keys(expected[section] ?? {}), ...Object.keys(actual[section] ?? {})])];
     for (const step of steps) {
-      const want = JSON.stringify(expected[section]?.[step] ?? null, null, 2);
+      const rules = matching(section, step, list);
+      let want = JSON.stringify(expected[section]?.[step] ?? null, null, 2);
+      for (const [from, to] of rules.flatMap((d) => d.rewrite ?? [])) want = want.replaceAll(from, to);
       const got = JSON.stringify(actual[section]?.[step] ?? null, null, 2);
       if (want === got) continue;
-      const allowed = skipped(section, step, list);
+      const allowed = rules.find((d) => !d.rewrite);
       if (allowed) {
         console.log(`skip ${section}.${step}: ${allowed.reason}`);
         continue;

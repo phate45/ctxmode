@@ -2,13 +2,11 @@
 /**
  * db-base — Reusable SQLite infrastructure for context-mode packages.
  *
- * Provides lazy-loading of better-sqlite3, WAL pragma setup, prepared
+ * Provides the bun:sqlite adapter, WAL pragma setup, prepared
  * statement caching interface, and DB file cleanup helpers for ContentStore.
  */
 
-import type DatabaseConstructor from "better-sqlite3";
-import type { Database as DatabaseInstance } from "better-sqlite3";
-import { createRequire } from "node:module";
+import { Database as BunDB } from "bun:sqlite";
 import { existsSync, unlinkSync } from "node:fs";
 // v1.0.130 — `acquireDbLock` + `locking_mode = EXCLUSIVE` were REMOVED.
 // See docs/adr/0001-sessiondb-multi-writer.md for the architectural
@@ -107,220 +105,20 @@ export class BunSQLiteAdapter {
   }
 }
 
-// ─────────────────────────────────────────────────────────
-// node:sqlite adapter (#228)
-// ─────────────────────────────────────────────────────────
+export type DatabaseInstance = BunSQLiteAdapter;
 
-/**
- * Wraps node:sqlite's DatabaseSync to provide better-sqlite3-compatible API.
- * Bridges: .pragma(), .transaction(). Everything else is passthrough.
- * Eliminates native addon SIGSEGV on Linux (nodejs/node#62515).
- */
-export class NodeSQLiteAdapter {
-  #raw: any; // DatabaseSync instance
-
-  constructor(rawDb: any) {
-    this.#raw = rawDb;
+/** Open a bun:sqlite database behind the better-sqlite3-shaped adapter. */
+export function openDatabase(path: string, opts?: { readonly?: boolean; timeout?: number }): DatabaseInstance {
+  const raw = new BunDB(path, {
+    readonly: opts?.readonly,
+    create: true,
+  });
+  const adapter = new BunSQLiteAdapter(raw);
+  // bun:sqlite has no busy-timeout constructor option, so set it via pragma (#243)
+  if (opts?.timeout) {
+    adapter.pragma(`busy_timeout = ${opts.timeout}`);
   }
-
-  pragma(source: string): any {
-    // "journal_mode = WAL" → PRAGMA journal_mode = WAL
-    // "table_xinfo(session_events)" → PRAGMA table_xinfo(session_events)
-    // "wal_checkpoint(TRUNCATE)" → PRAGMA wal_checkpoint(TRUNCATE)
-    const stmt = this.#raw.prepare(`PRAGMA ${source}`);
-    const rows = stmt.all();
-    if (!rows || rows.length === 0) return undefined;
-    if (rows.length > 1) return rows;
-    const values = Object.values(rows[0] as Record<string, unknown>);
-    return values.length === 1 ? values[0] : rows[0];
-  }
-
-  exec(sql: string): any {
-    // node:sqlite's exec() supports multi-statement natively
-    this.#raw.exec(sql);
-    return this;
-  }
-
-  prepare(sql: string): any {
-    const stmt = this.#raw.prepare(sql);
-    return {
-      run: (...args: unknown[]) => stmt.run(...args),
-      get: (...args: unknown[]) => stmt.get(...args),
-      all: (...args: unknown[]) => stmt.all(...args),
-      iterate: (...args: unknown[]) => {
-        // node:sqlite uses Symbol.iterator on StatementSync, not .iterate()
-        // Check if iterate exists, otherwise use Symbol.iterator
-        if (typeof stmt.iterate === 'function') {
-          return stmt.iterate(...args);
-        }
-        // Fallback: use all() to create an iterator
-        const rows = stmt.all(...args);
-        return rows[Symbol.iterator]();
-      },
-    };
-  }
-
-  transaction(fn: (...args: any[]) => any): any {
-    // node:sqlite has no transaction() method — manual BEGIN/COMMIT/ROLLBACK
-    return (...args: any[]) => {
-      this.#raw.exec("BEGIN");
-      try {
-        const result = fn(...args);
-        this.#raw.exec("COMMIT");
-        return result;
-      } catch (err) {
-        this.#raw.exec("ROLLBACK");
-        throw err;
-      }
-    };
-  }
-
-  close(): void {
-    this.#raw.close();
-  }
-}
-
-// ─────────────────────────────────────────────────────────
-// Lazy loader
-// ─────────────────────────────────────────────────────────
-
-let _Database: typeof DatabaseConstructor | null = null;
-
-/**
- * Probe whether the supplied node:sqlite DatabaseSync constructor links a
- * SQLite build that includes the FTS5 module. Some Node.js Linux builds
- * (e.g. v22.14.0 on Ubuntu) ship node:sqlite without FTS5 even though the
- * import succeeds, which silently breaks ctx_search/ctx_batch_execute and
- * the doctor's FTS5 check (issue #461).
- *
- * Returns true only when a `CREATE VIRTUAL TABLE … USING fts5(x)` statement
- * succeeds. Always returns false on any failure (constructor throw, missing
- * module, etc.) so the caller can fall through to better-sqlite3, whose
- * bundled SQLite always ships with FTS5.
- */
-export function nodeSqliteHasFts5(DatabaseSync: any): boolean {
-  let probe: any = null;
-  try {
-    probe = new DatabaseSync(":memory:");
-    probe.exec("CREATE VIRTUAL TABLE __fts5_probe USING fts5(x)");
-    return true;
-  } catch {
-    return false;
-  } finally {
-    try { probe?.close(); } catch { /* probe never opened or already closed */ }
-  }
-}
-
-/**
- * Returns true when the current runtime ships a built-in SQLite binding:
- * - Bun has `bun:sqlite` always
- * - Node has `node:sqlite` since 22.5 (no flag since 22.13)
- *
- * Mirrors the helper in hooks/ensure-deps.mjs:61. Exported so the platform
- * gate in loadDatabase() can be unit-tested without spawning a child
- * process. `versionsOverride` and `bunOverride` are injection points for
- * tests — production callers pass nothing.
- *
- * Widening the gate from `process.platform === "linux"` to this helper is
- * required for Node 26 on macOS arm64 (#551): Node 26 removed
- * `info.This()` from V8 PropertyCallbackInfo, breaking better-sqlite3
- * 12.9.0's native compile. Using node:sqlite sidesteps the native addon
- * entirely on every platform that has it.
- */
-export function hasModernSqlite(
-  versionsOverride?: NodeJS.ProcessVersions,
-  bunOverride?: unknown,
-): boolean {
-  const bun = bunOverride !== undefined ? bunOverride : (globalThis as any).Bun;
-  if (typeof bun !== "undefined" && bun !== null) return true;
-  const versions = versionsOverride ?? process.versions;
-  const [majorStr, minorStr] = (versions.node ?? "0.0.0").split(".");
-  const major = Number(majorStr);
-  const minor = Number(minorStr);
-  if (!Number.isFinite(major) || !Number.isFinite(minor)) return false;
-  return major > 22 || (major === 22 && minor >= 5);
-}
-
-/**
- * Lazy-load the SQLite driver for the current runtime.
- * Bun → bun:sqlite via BunSQLiteAdapter (issue #45).
- * Modern Node (>= 22.5) → node:sqlite via NodeSQLiteAdapter when it ships FTS5 (#228, #461, #551).
- * Other Node (or modern Node without FTS5) → better-sqlite3 (native addon).
- */
-export function loadDatabase(): typeof DatabaseConstructor {
-  if (!_Database) {
-    const require = createRequire(import.meta.url);
-
-    if ((globalThis as any).Bun) {
-      // Bun runtime — use bun:sqlite directly.
-      // Array.join() prevents esbuild from resolving the specifier at bundle time.
-      const BunDB = require(["bun", "sqlite"].join(":")).Database;
-      _Database = function BunDatabaseFactory(path: string, opts?: any) {
-        const raw = new BunDB(path, {
-          readonly: opts?.readonly,
-          create: true,
-        });
-        const adapter = new BunSQLiteAdapter(raw);
-        // Propagate busy_timeout — better-sqlite3 does this via constructor
-        // option but bun:sqlite does not, so we set it via pragma (#243)
-        if (opts?.timeout) {
-          adapter.pragma(`busy_timeout = ${opts.timeout}`);
-        }
-        return adapter;
-      } as any;
-    } else if (hasModernSqlite()) {
-      // Any Node >= 22.5 — try node:sqlite to avoid the native addon path
-      // entirely. Historically this was Linux-only (avoiding the Linux
-      // SIGSEGV per nodejs/node#62515, #228), but Node 26 also broke
-      // better-sqlite3's native compile on macOS arm64 by removing
-      // V8 `info.This()` (#551). The built-in `node:sqlite` ships its
-      // own SQLite, so it sidesteps both issues at once.
-      //
-      // Probe FTS5 support before committing — some Node builds ship
-      // node:sqlite without FTS5, which would silently break ctx_search
-      // (#461). The probe runs at most once per process (cached via
-      // _Database below), so the cost of an in-memory DatabaseSync is
-      // negligible.
-      let DatabaseSync: any = null;
-      try {
-        // Array.join() prevents esbuild from resolving the specifier at bundle time
-        // (mirrors the bun:sqlite branch above).
-        ({ DatabaseSync } = require(["node", "sqlite"].join(":")));
-      } catch {
-        DatabaseSync = null;
-      }
-      if (DatabaseSync && nodeSqliteHasFts5(DatabaseSync)) {
-        _Database = function NodeDatabaseFactory(path: string, opts?: any) {
-          const raw = new DatabaseSync(path, {
-            readOnly: opts?.readonly ?? false,
-          });
-          const adapter = new NodeSQLiteAdapter(raw);
-          // Propagate busy_timeout — node:sqlite's DatabaseSync constructor
-          // silently ignores `{ timeout }` (unlike better-sqlite3's native
-          // C++ constructor), so we set it via PRAGMA, mirroring the Bun
-          // branch above. Without this, the default is 0 and the first
-          // write contention surfaces as immediate `SQLITE_BUSY`/`database
-          // is locked` — defeating the 30s grace `withRetry()` is built
-          // around. See issue #642 and ADR-0001 (multi-writer contract).
-          if (opts?.timeout) {
-            adapter.pragma(`busy_timeout = ${opts.timeout}`);
-          }
-          return adapter;
-        } as any;
-      } else {
-        // node:sqlite missing or built without FTS5 — fall through to
-        // better-sqlite3. Trade-off: on Node 26 + macOS this may now hit
-        // the V8 ABI break (#551). A visible crash on the rare
-        // unstable build is preferable to silent "no such module: fts5"
-        // on every ctx_search call.
-        _Database = require("better-sqlite3") as typeof DatabaseConstructor;
-      }
-    } else {
-      // Old Node (< 22.5) without bun:sqlite — fall back to better-sqlite3.
-      _Database = require("better-sqlite3") as typeof DatabaseConstructor;
-    }
-  }
-  return _Database!;
+  return adapter;
 }
 
 // ─────────────────────────────────────────────────────────

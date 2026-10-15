@@ -2,15 +2,14 @@
  * Pre-warm + markdown ingest helpers for context-wrapper.
  *
  * Discovers .claude/context-mode.json, resolves source files, applies our
- * markdown-specific preprocessing, and indexes into the wrapper-owned
- * context-mode FTS5 database so search() works immediately.
+ * markdown-specific preprocessing, and indexes into the FTS5 content
+ * database so search() works immediately.
  */
 
-import { readFileSync, readdirSync, statSync, mkdirSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, dirname, basename, resolve, relative } from "node:path";
-import { ContentStore } from "../node_modules/context-mode/src/store.ts";
-import { resolveContentStorePath } from "../node_modules/context-mode/src/session/db.ts";
+import { ContentStore } from "./store.ts";
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -265,17 +264,6 @@ function preprocessFile(file: ResolvedFile, source: SourceConfig): string {
   });
 }
 
-// ── DB Path Resolution ──────────────────────────────────────────────
-
-export function getContentDbPath(storageRoot: string, projectDir: string): string {
-  const contentDir = join(storageRoot, "content");
-  mkdirSync(contentDir, { recursive: true });
-  return resolveContentStorePath({
-    projectDir: resolve(projectDir),
-    contentDir,
-  });
-}
-
 // ── Wrapper-side Path Indexing ──────────────────────────────────────
 
 export function resolveIndexPathFiles(opts: IndexPathOptions): {
@@ -339,20 +327,17 @@ export interface PrewarmSourceSummary {
 }
 
 /**
- * Index configured sources into the context-mode FTS5 database.
+ * Index configured sources into the FTS5 database at `dbPath`.
  */
 export function prewarm(
   config: Config,
-  storageRoot: string,
-  projectDir: string,
+  dbPath: string,
   sourceBase: string,
 ): {
   totalSources: number;
   totalChunks: number;
-  dbPath: string;
   sources: PrewarmSourceSummary[];
 } {
-  const dbPath = getContentDbPath(storageRoot, projectDir);
   const store = new ContentStore(dbPath);
 
   let totalSources = 0;
@@ -389,7 +374,6 @@ export function prewarm(
   return {
     totalSources,
     totalChunks,
-    dbPath,
     sources: [...summaries.values()],
   };
 }

@@ -2,9 +2,6 @@
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 
-/** Known JS runtime binary names (base filename without extension). */
-const JS_RUNTIMES: ReadonlySet<string> = new Set(["node", "bun", "deno"]);
-
 /**
  * Allowlist for SHELL env override. Only POSIX shells + Windows shells permit
  * arbitrary command interpretation; anything else (e.g., /usr/bin/python set
@@ -17,7 +14,6 @@ const JS_RUNTIMES: ReadonlySet<string> = new Set(["node", "bun", "deno"]);
  * Match is case-insensitive; `.exe` extension tolerated for Windows binaries.
  */
 const ALLOWED_SHELL_BASENAMES = /^(bash|sh|zsh|dash|pwsh|powershell|cmd)(\.exe)?$/i;
-const BUN_BASENAME = /^bun(\.exe)?$/i;
 
 function runtimeBasename(runtimePath: string): string {
   const segments = runtimePath.split(/[\\/]/);
@@ -54,8 +50,8 @@ export interface RuntimeInfo {
 }
 
 export interface RuntimeMap {
-  javascript: string | null;
-  typescript: string | null;
+  javascript: string;
+  typescript: string;
   python: string | null;
   shell: string;
 }
@@ -111,51 +107,6 @@ function runnableExists(cmd: string): boolean {
   } catch {
     return false;
   }
-}
-
-function bunExists(): boolean {
-  if (commandExists("bun")) return true;
-  for (const p of bunFallbackPaths()) {
-    if (existsSync(p)) return true;
-  }
-  return false;
-}
-
-function bunCommand(): string {
-  // Prefer absolute .exe paths so spawn() can run with shell:false on Windows.
-  // `where bun` may resolve to a `bun.cmd` npm shim (#506) which CreateProcess
-  // cannot execute directly — return the real .exe wherever we can find one.
-  for (const p of bunFallbackPaths()) {
-    if (existsSync(p)) return p;
-  }
-  // Bare name only if PATH resolution confirms it. On Windows this is
-  // typically a .cmd shim — the executor's needsShell list (which now
-  // includes "bun" — see #506) ensures shell:true so cmd.exe can resolve it.
-  if (commandExists("bun")) return "bun";
-  // Synthetic last-resort path for diagnostics/error messages.
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-  return isWindows ? `${home}\\.bun\\bin\\bun.exe` : `${home}/.bun/bin/bun`;
-}
-
-/** Fallback paths where Bun may be installed but not on PATH. */
-function bunFallbackPaths(): string[] {
-  const home = process.env.HOME ?? process.env.USERPROFILE ?? "";
-  if (isWindows) {
-    const localAppData = process.env.LOCALAPPDATA ?? "";
-    const appData = process.env.APPDATA ?? "";
-    return [
-      // Native bun installer locations (irm bun.sh/install.ps1).
-      ...(home ? [`${home}\\.bun\\bin\\bun.exe`] : []),
-      ...(localAppData ? [`${localAppData}\\bun\\bin\\bun.exe`] : []),
-      // npm i -g bun installs bun.exe under the npm prefix (typically
-      // %APPDATA%\npm\node_modules\bun\bin\bun.exe). Without this, npm
-      // installs were "found" via bun.cmd shim on PATH and the bare "bun"
-      // string was returned — spawn() then ENOENT'd because CreateProcess
-      // can't execute .cmd files (#506).
-      ...(appData ? [`${appData}\\npm\\node_modules\\bun\\bin\\bun.exe`] : []),
-    ];
-  }
-  return home ? [`${home}/.bun/bin/bun`] : [];
 }
 
 /** Well-known Git-for-Windows bash.exe locations (MSYS bash that performs
@@ -223,74 +174,7 @@ function resolveWindowsShell(windowsBash: string | null = resolveWindowsBash()):
           : "cmd.exe");
 }
 
-/**
- * Resolve the JavaScript runtime used by PolyglotExecutor.
- *
- * PR #190 (f69b0d2) made `process.execPath` the default so snap-Node
- * envs would not re-invoke the snap wrapper via PATH. That assumed
- * `process.execPath` always points at a JS runtime — true on Node,
- * tsx, and snap-Node, but FALSE when context-mode runs in-process
- * inside a bun-compiled self-contained binary (OpenCode, Kilo, …).
- * In those hosts, `process.execPath` resolves to `opencode.exe` /
- * `opencode` (NOT node), and spawning that with a `.js` argument
- * triggers the yargs "Failed to change directory" error (#731).
- *
- * Fix: gate `process.execPath` on the existing `JS_RUNTIMES`
- * allowlist (single source of truth — same set used by
- * `buildNodeCommand()` in src/adapters/types.ts since PR #708). When
- * the execPath basename is not a known JS runtime, fall back to a
- * PATH-resolved `node`. If neither is reachable, return `null` and
- * let ctx_doctor surface an actionable error.
- *
- * The cross-OS guard is the allowlist itself — NOT a `win32` check.
- * OpenCode ships self-contained binaries on macOS and Linux too,
- * and the bug reproduces identically there.
- */
-export function resolveJavascriptRuntime(
-  bun: string | null,
-  deps: {
-    execPath?: string;
-    commandExists?: (cmd: string) => boolean;
-  } = {},
-): string | null {
-  if (bun) return bun;
-
-  const execPath = deps.execPath ?? process.execPath;
-  const cmdExists = deps.commandExists ?? commandExists;
-
-  // Cross-OS basename: split on either separator, strip optional `.exe`.
-  const base = execPath
-    .split(/[\\/]/)
-    .pop()!
-    .replace(/\.exe$/i, "");
-
-  if (JS_RUNTIMES.has(base)) {
-    // Real JS runtime (node, bun, deno) — preserves #190 snap-Node fix
-    // because the snap wrapper's binary is literally named `node`.
-    //
-    // Issue #800 — liveness guard: on Homebrew, process.execPath points into
-    // the versioned Cellar (/opt/homebrew/Cellar/node/26.0.0/bin/node).
-    // `brew upgrade` + `brew cleanup` deletes the old Cellar, so the path
-    // dangles for the life of the already-running MCP server.  If the path
-    // doesn't exist on disk, skip it and fall through to PATH node.
-    if (existsSync(execPath)) {
-      return execPath;
-    }
-    // Stale execPath (deleted Cellar, corrupted install, uninstall while
-    // process alive).  Fall through to PATH resolution below.
-  }
-
-  // Host binary (opencode/kilo/etc.) — fall back to node on PATH.
-  if (cmdExists("node")) return "node";
-
-  // No usable runtime — doctor + summary must handle null gracefully.
-  return null;
-}
-
 export function detectRuntimes(): RuntimeMap {
-  const hasBun = bunExists();
-  const bun = hasBun ? bunCommand() : null;
-
   // Honor SHELL env var when it points at a real binary AND the basename is
   // an allowlisted shell. Lets users with non-standard setups (custom bash,
   // msys2, pwsh) pin context-mode to their preferred shell.
@@ -314,14 +198,9 @@ export function detectRuntimes(): RuntimeMap {
     : null;
 
   return {
-    javascript: resolveJavascriptRuntime(bun),
-    typescript: bun
-      ? bun
-      : commandExists("tsx")
-        ? "tsx"
-        : commandExists("ts-node")
-          ? "ts-node"
-          : null,
+    // JS/TS run on this process's own runtime: bun, or the compiled binary acting as bun.
+    javascript: process.execPath,
+    typescript: process.execPath,
     python: runnableExists("python3")
       ? "python3"
       : runnableExists("python")
@@ -335,13 +214,8 @@ export function detectRuntimes(): RuntimeMap {
   };
 }
 
-export function hasBunRuntime(): boolean {
-  return bunExists();
-}
-
 export function getAvailableLanguages(runtimes: RuntimeMap): Language[] {
-  const langs: Language[] = ["javascript", "shell"];
-  if (runtimes.typescript) langs.push("typescript");
+  const langs: Language[] = ["javascript", "shell", "typescript"];
   if (runtimes.python) langs.push("python");
   return langs;
 }
@@ -353,27 +227,8 @@ export function buildCommand(
 ): string[] {
   switch (language) {
     case "javascript":
-      if (!runtimes.javascript) {
-        // #731: in-process plugin host (opencode/kilo binary) AND no
-        // PATH-resolvable node. Refuse early with an actionable error
-        // instead of spawning the host binary (the original bug shape).
-        throw new Error(
-          "No JavaScript runtime available. Install Node.js or Bun on PATH (the host process is not itself a JS runtime).",
-        );
-      }
-      return BUN_BASENAME.test(runtimeBasename(runtimes.javascript))
-        ? [runtimes.javascript, "run", filePath]
-        : [runtimes.javascript, filePath];
-
     case "typescript":
-      if (!runtimes.typescript) {
-        throw new Error(
-          "No TypeScript runtime available. Install one of: bun (recommended), tsx (npm i -g tsx), or ts-node.",
-        );
-      }
-      if (BUN_BASENAME.test(runtimeBasename(runtimes.typescript))) return [runtimes.typescript, "run", filePath];
-      if (runtimes.typescript === "tsx") return ["tsx", filePath];
-      return ["ts-node", filePath];
+      return [runtimes.javascript, filePath];
 
     case "python":
       if (!runtimes.python) {

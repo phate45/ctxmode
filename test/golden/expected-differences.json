@@ -1,3 +1,12 @@
 [
-  { "key": "timeline", "reason": "search sort: \"timeline\" is removed in ctxmode" }
+  { "key": "timeline", "reason": "search sort: \"timeline\" is removed in ctxmode" },
+  {
+    "key": "tools.search.properties",
+    "reason": "search drops `sort` (timeline) and `project` (shared-DB scope): both read the removed session store"
+  },
+  {
+    "key": "*",
+    "reason": "output text names the tools as exposed (search, batch_execute, ...), not upstream's ctx_* names",
+    "rewrite": [["ctx_", ""]]
+  }
 ]

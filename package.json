@@ -4,30 +4,22 @@
   "type": "module",
   "private": true,
   "description": "Pre-warm wrapper for context-mode MCP server — indexes vault notes on startup",
+  "license": "Elastic-2.0",
   "scripts": {
-    "dev": "tsx src/wrapper.ts",
-    "build": "esbuild src/wrapper.ts --bundle --platform=node --target=node18 --format=esm --outfile=wrapper.bundle.mjs --packages=external --minify",
-    "start": "node wrapper.bundle.mjs",
-    "check": "tsx scripts/check-upstream.ts",
-    "bump": "tsx scripts/bump.ts",
-    "test:filters": "tsx scripts/output-filter-smoke.ts",
-    "test:e2e": "tsx scripts/e2e-smoke.ts",
-    "test": "bun run test:filters && bun run test:e2e && bun run test:golden",
-    "test:golden": "bun test/golden/run.ts --check -- node wrapper.bundle.mjs",
+    "start": "bun src/main.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test/golden/run.ts --check -- bun src/main.ts && bun test test/",
     "parity:rank": "bun scripts/parity-rank.ts"
   },
   "dependencies": {
+    "@mixmark-io/domino": "^2.2.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
-    "context-mode": "github:mksglu/context-mode#v1.0.169",
-    "zod": "^4.3.6"
+    "turndown": "^7.2.0",
+    "turndown-plugin-gfm": "^1.0.2",
+    "zod": "^3.25.0"
   },
   "devDependencies": {
-    "esbuild": "^0.27.3",
-    "tsx": "^4.21.0"
-  },
-  "trustedDependencies": [
-    "better-sqlite3",
-    "esbuild"
-  ],
-  "license": "Elastic-2.0"
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
+  }
 }

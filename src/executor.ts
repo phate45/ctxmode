@@ -354,18 +354,10 @@ export class PolyglotExecutor {
     background = false,
   ): Promise<ExecResult> {
     return new Promise((res) => {
-      // Only .cmd/.bat shims need shell on Windows; real executables don't.
-      // Using shell: true globally causes process-tree kill issues with MSYS2/Git Bash.
-      // "bun" is included as defense-in-depth: bunCommand() prefers absolute
-      // .exe paths now (#506), but if it falls back to the bare "bun" string
-      // on Windows that resolution typically goes through a `bun.cmd` shim
-      // (npm i -g bun) which CreateProcess can't execute without cmd.exe.
-      const needsShell = isWin && ["tsx", "ts-node", "bun"].includes(cmd[0]);
-
       // On Windows with Git Bash, pass the script as `bash -c "source /posix/path"`
       // rather than `bash /path/to/script.sh`. This avoids MSYS2 path mangling
       // while still allowing MSYS_NO_PATHCONV to protect non-ASCII paths in commands.
-      let spawnCmd = cmd[0];
+      const spawnCmd = cmd[0];
       let spawnArgs: string[];
       if (isWin && cmd.length === 2 && cmd[1]) {
         const posixPath = cmd[1].replace(/\\/g, "/");
@@ -376,11 +368,13 @@ export class PolyglotExecutor {
           : cmd.slice(1);
       }
 
-      // Common options shared by both spawn variants below.
+      const env = this.#buildSafeEnv(sandboxTmpDir);
+      // Lets a compiled binary act as the bun CLI when it runs JS/TS scripts.
+      if (spawnCmd === process.execPath) env["BUN_BE_BUN"] = "1";
       const commonOpts = {
         cwd,
         stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
-        env: this.#buildSafeEnv(sandboxTmpDir),
+        env,
         // On Unix, create a new process group so killTree can kill all children
         detached: !isWin,
         // Hide the spawned-process console window on Windows. Without this,
@@ -390,20 +384,7 @@ export class PolyglotExecutor {
         ...buildSpawnOptions(process.platform),
       };
 
-      // DEP0190 fix: when shell is true (Windows .cmd/.bat shims), pass a
-      // single command string instead of cmd + args array. Node.js warns
-      // that args are unsafely concatenated when shell:true is combined with
-      // the args-array form of spawn(). Colllapsing to a string avoids the
-      // warning while preserving the same shell behavior.
-      let proc: ReturnType<typeof spawn>;
-      if (needsShell) {
-        const fullCmd = [spawnCmd, ...spawnArgs]
-          .map(a => /\s/.test(a) ? JSON.stringify(a) : a)
-          .join(" ");
-        proc = spawn(fullCmd, [], { ...commonOpts, shell: true });
-      } else {
-        proc = spawn(spawnCmd, spawnArgs, { ...commonOpts, shell: false });
-      }
+      const proc = spawn(spawnCmd, spawnArgs, { ...commonOpts, shell: false });
 
       let timedOut = false;
       let resolved = false;
