@@ -340,6 +340,9 @@ export class PolyglotExecutor {
         buildShellScriptContent(shellCode, process.env.PATH, process.platform),
         { encoding: "utf-8", mode: 0o700 },
       );
+    } else if (language === "javascript" || language === "typescript") {
+      // Hides #spawn's BUN_BE_BUN from user code and its children; same line keeps line numbers.
+      writeFileSync(fp, `delete process.env.BUN_BE_BUN;${code}`, "utf-8");
     } else {
       writeFileSync(fp, code, "utf-8");
     }
