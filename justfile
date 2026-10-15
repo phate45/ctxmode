@@ -17,8 +17,9 @@ set shell := ["bash", "-eu", "-o", "pipefail", "-c"]
 build_bin := "release/build/ctxmode"
 release_dir := "release"
 
-# The oldest glibc the binary must load on: Debian 13 ships 2.41.
-glibc_max := "2.41"
+# The glibc floor README promises, measured from Bun's own runtime; a Bun
+# upgrade that needs newer symbols fails the build instead of the promise.
+glibc_max := "2.17"
 
 [private]
 default:
@@ -31,10 +32,12 @@ install:
 serve:
   bun src/main.ts
 
-[doc("Typecheck, golden parity and unit/e2e tests. 0 pass, 1 fail")]
+[doc("Typecheck, golden parity and unit/e2e tests. 0 pass, 1 fail, 2 could not run")]
 gate:
   #!/usr/bin/env bash
   set -uo pipefail
+  command -v bun >/dev/null || { echo "gate needs bun"; exit 2; }
+  [ -d node_modules ] || { echo "no node_modules; run \`just install\`"; exit 2; }
   bun run typecheck || exit 1
   bun run test || exit 1
   echo "gate passed"

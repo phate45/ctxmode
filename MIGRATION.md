@@ -21,7 +21,9 @@ context-wrapper ran the upstream context-mode server as a subprocess behind a No
 | Search throttle env vars | `CONTEXT_MODE_SEARCH_*` | `CTXMODE_SEARCH_*` |
 | Strict fetch env var | `CTX_FETCH_STRICT` | `CTXMODE_FETCH_STRICT` |
 
-The first session in each repo builds `<repo>/.ctxmode/baseline.db`. To keep that cost out of a session, run `ctxmode prewarm` in the project once after migrating. The directory ignores itself; no `.gitignore` change is needed.
+Switch the MCP server and the subagent hook in the same change: `ctxmode hook` tells subagents to call `mcp__ctxmode__*` tools, which do not exist while `.mcp.json` still points at context-wrapper, and the old hook teaches `mcp__context-mode__*` names that ctxmode does not serve.
+
+The first session in each repo builds `<repo>/.ctxmode/<id>.db`, one baseline per config file. To keep that cost out of a session, run `ctxmode prewarm` in the project once after migrating. The directory ignores itself; no `.gitignore` change is needed.
 
 ## Behaviour changes
 

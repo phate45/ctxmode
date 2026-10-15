@@ -107,9 +107,9 @@ Hardcode a list of file paths. Relative paths resolve from `path`.
 | `path` | Base directory, absolute or relative to the config's project (see above). Required for glob, optional for exec/paths (used as CWD / base for relative paths) |
 | `glob` | File pattern to match (e.g. `*.md`). Requires `path`. |
 | `recursive` | Walk subdirectories when using glob. Default: `false` |
-| `exec` | Shell command that outputs a JSON array of file paths |
+| `exec` | Shell command that outputs a JSON array of file paths. If it fails, the source keeps the files it had in the baseline. |
 | `paths` | Explicit array of file paths |
-| `stripFrontmatter` | Remove YAML `---` frontmatter blocks from start of files. Default: `false` |
+| `stripFrontmatter` | Remove YAML `---` frontmatter blocks from start of files. Default: `false` (unlike `index` with `path`, where it defaults to `true`) |
 | `prefixDates` | For date-named files (`2026-02-28.md`): prefix `##` headings with `[YYYY-MM-DD]`. Default: `false` |
 
 ### Public Tool Surface
@@ -124,6 +124,10 @@ ctxmode exposes only:
 - `batch_read`
 
 Upstream's meta and session tools (stats, doctor, upgrade, purge, insight, timeline search) are not part of the fork.
+
+Every tool that reads a file by path (`index`, `batch_read`, `execute` with `path`) refuses files that match a Claude Code `Read(...)` deny rule and anything that is not a regular file (FIFOs, devices). `execute` with `path` must also stay inside the working directory unless a `Read(...)` allow rule names the file.
+
+`fetch_and_index` fetches http(s) URLs only and refuses link-local (including cloud metadata), multicast and reserved addresses, checked before the first request and before each redirect. Loopback and private addresses are allowed unless `CTXMODE_FETCH_STRICT=1`. The check runs before connecting, so a DNS answer that changes in between is not caught. `HTTP_PROXY`/`HTTPS_PROXY` are honoured.
 
 ### Searching Pre-Warmed Content
 
@@ -167,22 +171,22 @@ index(path: "/path/to/docs", glob: "*.txt", recursive: true, source: "docs")
 | `stripFrontmatter` | path | `true` | Strip YAML frontmatter before indexing |
 | `prefixDates` | path | `false` | For `YYYY-MM-DD.md`, prefix `##` headings with `[date]` |
 
-Path-based indexing applies the same preprocessing as pre-warming, and files matching a Read deny rule are skipped. Each file becomes its own searchable source.
+Path-based indexing runs the same preprocessing as pre-warming, except that `stripFrontmatter` defaults to `true` here and to `false` for configured sources. Files matching a Read deny rule are skipped and reported. Each file becomes its own searchable source.
 
 ## How It Works
 
 On startup ctxmode:
 
-1. **Discovers** the config: walks up from CWD looking for `.claude/ctxmode.json`. Set `CTXMODE_CONFIG` to an exact config file path to skip the walk and load that file directly (a set-but-unreadable or invalid file is a hard error).
-2. **Restores the baseline**: `<repo>/.ctxmode/baseline.db` holds the indexed corpus plus a manifest of every source file's path, mtime, size and sha256. `<repo>` is the main checkout found via `git --git-common-dir`, so worktrees share one baseline; outside git it is the config's directory. The directory carries its own `.gitignore`.
-3. **Applies the diff**: files whose mtime and size match are skipped; the rest are hashed, and only changed, added or removed files are re-indexed, in a private session copy under `~/.cache/ctxmode/sessions/<pid>.db`.
+1. **Discovers** the config: walks up from CWD looking for `.claude/ctxmode.json`. Set `CTXMODE_CONFIG` to an exact config file path to skip the walk and load that file directly. A source without a `label` or a file-selection strategy is skipped with a warning; an unreadable `CTXMODE_CONFIG` or a malformed config is an error.
+2. **Restores the baseline**: `<repo>/.ctxmode/<id>.db` holds the indexed corpus plus a manifest of every source file's path, mtime, size and sha256. `<repo>` is the main checkout found via `git --git-common-dir`, outside git the config's directory. `<id>` hashes the config's path inside its checkout, so each config in a repo has its own baseline and worktrees share their main checkout's; a config outside the repo is identified by its absolute path. The directory carries its own `.gitignore`.
+3. **Applies the diff**: files whose mtime and size match are skipped, unless modified within a second of the last scan; the rest are hashed, and only changed, added or removed files are re-indexed, in a private session copy under `~/.cache/ctxmode/sessions/<pid>.db`.
 4. **Writes back** an updated baseline when anything changed (`VACUUM INTO` a staging file, then an atomic rename), and serves.
 
-A warm start takes tens of milliseconds; a cold build (first run, or a config or store-format change) indexes everything once. The session DB is deleted on exit, and session DBs of dead processes are swept at the next startup.
+A warm start takes tens of milliseconds; a cold build (first run, or a change to the sources other than their descriptions, or to the store format) indexes everything once. The session DB is deleted on exit, and session DBs of dead processes are swept at the next startup.
 
-`ctxmode prewarm` runs the same build/refresh without serving, which is useful to warm a project ahead of its first session.
+`ctxmode prewarm` runs the same build/refresh without serving, which is useful to warm a project ahead of its first session. It exits 1 on a config error or a failed build.
 
-If no config file is found, ctxmode serves with an empty knowledge base.
+If no config file is found, or the config or the build fails, the server logs the error to stderr and serves with an empty knowledge base.
 
 ## Preprocessing Details
 

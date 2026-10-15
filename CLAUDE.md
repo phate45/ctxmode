@@ -11,14 +11,14 @@ See `README.md` for the user-facing guide and `MIGRATION.md` for moving consumer
 | File | Purpose |
 |------|---------|
 | `src/main.ts` | Entry point. Subcommands: `serve` (default), `prewarm`, `hook`, `--version`. |
-| `src/server.ts` | MCP server: tool definitions, descriptions, search throttle, fetch + HTML→markdown, path ingest for `index`. |
+| `src/server.ts` | MCP server: tool definitions, descriptions, search throttle, `guardPath`, path ingest for `index`. |
+| `src/fetch.ts` | `fetch_and_index`'s network layer: URL/address policy per hop, redirects, size cap, timeout, HTML→markdown. |
 | `src/cache.ts` | Baseline DB lifecycle: restore, diff against the manifest, apply, write back, session DB cleanup. |
-| `src/prewarm.ts` | Config discovery, source resolution (glob/exec/paths), preprocessing, `PREPROCESS_VERSION`. |
+| `src/prewarm.ts` | Config schema and discovery, source resolution (glob/exec/paths), preprocessing, `PREPROCESS_VERSION`. |
 | `src/hook.ts` | PreToolUse subagent routing hook. |
-| `src/store.ts` | `ContentStore`: FTS5 porter + trigram tables, chunking, search, `STORE_VERSION`. |
-| `src/executor.ts`, `src/runtime.ts` | Sandboxed execution of JS/TS/Python/shell. |
-| `src/security.ts`, `src/util/claude-config.ts` | Deny rules read from Claude Code settings. A trust boundary. |
-| `src/db-base.ts` | `bun:sqlite` setup, WAL pragmas. |
+| `src/store.ts` | `ContentStore` on `bun:sqlite`: FTS5 porter + trigram tables, chunking, search, `STORE_VERSION`. |
+| `src/executor.ts` | Runs JS/TS/Python/shell code in a child process; runtime detection. |
+| `src/security.ts` | Permission rules read from Claude Code settings. A trust boundary. |
 | `test/golden/` | Synthetic corpus + recorded transcript of the pre-fork wrapper; the parity net. |
 | `scripts/parity-rank.ts` | Ranking parity on a real corpus. Its outputs are private and never committed. |
 
@@ -26,19 +26,27 @@ Files that start with `// Vendored from mksglu/context-mode ...` came from upstr
 
 ## Architecture
 
-One process, no subprocess or proxy. `bun:sqlite` is the only database driver. JS/TS code runs through `process.execPath` with `BUN_BE_BUN=1`, so the binary is its own Bun; the variable is deleted before user code runs, because anything it spawns (Claude Code included) would otherwise start as Bun.
+One server process, no proxy. `bun:sqlite` is the only database driver; fetch runs in-process. Child processes are spawned only for `execute`/`batch_execute` code (one per script, in its own process group), for `exec` sources, and for one `git rev-parse` per pre-warm to find the repo root. Startup spawns nothing else: runtimes are found with `Bun.which`.
+
+JS/TS code runs through `process.execPath` with `BUN_BE_BUN=1`, so the binary is its own Bun. A `--preload` script deletes the variable before user code runs, because anything it spawns (Claude Code included) would otherwise start as Bun. Every prefix the executor adds sits on the code's first line, so error line numbers match the caller's code (Python with `path` is the exception, +1).
+
+### File access
+
+`guardPath()` in `server.ts` is the one gate for every file a tool reads by path: `index` (file and directory walk), `batch_read`, and `execute` with `path`. It applies `Read(...)` deny rules to all of them, keeps `execute` inside the project root unless a `Read(...)` allow rule names the file (the boundary upstream applied), and opens the file `O_NONBLOCK` and `fstat`s that fd so FIFOs and devices are refused instead of hanging the server. Add new path-reading features through it.
 
 ### Pre-warm cache
 
-- Baseline: `<repo>/.ctxmode/baseline.db`. `<repo>` is the parent of `git --git-common-dir` (worktrees share it), else the config's `sourceBase`. The directory writes its own `.gitignore` of `*`.
-- The manifest lives inside the baseline as tables: one cache key plus `(label, source, path, mtime_ns, size, sha256)` per file. One file means one atomic rename, so concurrent write-backs need no lock.
-- Cache key = `STORE_VERSION` + hash of the config's `sources` + `PREPROCESS_VERSION`. **Bump `STORE_VERSION` when chunking, schema or ranking inputs change, and `PREPROCESS_VERSION` when preprocessing output changes**; otherwise baselines keep stale content.
+- Baseline: `<repo>/.ctxmode/<id>.db`, one per config. `<repo>` is the parent of `git --git-common-dir`, else the config's `sourceBase`. `<id>` is a 12-hex sha256 of the config's path relative to its checkout's top level (worktrees therefore share), or of its absolute path when the config lives outside the checkout. The directory writes its own `.gitignore` of `*`.
+- The manifest lives inside the baseline as tables: the cache key and scan start time, plus `(label, source, path, mtime_ns, size, sha256)` per file. One file means one atomic rename, so concurrent write-backs need no lock.
+- A file whose stat matches is clean unless its mtime is within a second of the last scan; those are re-hashed (racy-clean).
+- An `exec` source whose command fails keeps its manifest rows and indexed content.
+- Cache key = `STORE_VERSION` + hash of the config's `sources` without their `description`s + `PREPROCESS_VERSION`. **Bump `STORE_VERSION` when chunking, schema or ranking inputs change, and `PREPROCESS_VERSION` when preprocessing output changes**; otherwise baselines keep stale content.
 - Session DB: `${XDG_CACHE_HOME:-~/.cache}/ctxmode/sessions/<pid>.db`, deleted on exit; dead-PID leftovers are swept at startup.
 - FTS rowids are `sourceId * 2^20 + n`, so deleting a source is a rowid range, not a scan of the UNINDEXED `source_id` column. Full `optimize` runs only after a cold build.
 
 ### Config
 
-Walk up from CWD for `.claude/ctxmode.json` (first match wins). `CTXMODE_CONFIG` names an exact file instead and hard-errors if unreadable. A relative source `path` resolves against `sourceBase`: the directory holding `.claude/`, or the launch CWD under `CTXMODE_CONFIG`. Each consuming project owns its config; none lives here.
+Walk up from CWD for `.claude/ctxmode.json` (first match wins). `CTXMODE_CONFIG` names an exact file instead. The zod schema in `prewarm.ts` is the config's single definition: `sources` defaults to `[]`, a bad source is skipped with a stderr line, and a malformed top level or an unreadable `CTXMODE_CONFIG` throws. `ctxmode prewarm` exits 1 on any such error; `serve` logs it and serves an empty knowledge base, as it does when the pre-warm itself fails. A relative source `path` resolves against `sourceBase`: the directory holding `.claude/`, or the launch CWD under `CTXMODE_CONFIG`. Each consuming project owns its config; none lives here.
 
 | Strategy | Required Fields | Description |
 |----------|----------------|-------------|
