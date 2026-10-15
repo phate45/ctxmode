@@ -4,7 +4,7 @@
 #     just gate     ->  0  typecheck and tests pass
 #     just build    ->  0  glibc-checked binary in release/build/
 #     just smoke    ->  0  that binary passes golden parity with no bun on PATH
-#     just release  ->  0  gate, build, smoke, then release/ctxmode + .sha256
+#     just release  ->  0  gate, build, smoke, then release/ctxmode + .sha256, tagged v<version>
 #
 # EXIT CODES ARE THE INTERFACE:
 #   0  ok            2  could not ask or could not run (missing tool, no binary)
@@ -86,7 +86,7 @@ smoke:
   echo "SMOKE PASS: $bin"
 
 # A dirty tree would publish a binary whose SHA names no commit.
-[doc("Gate, build, smoke, then publish release/ctxmode. 0 ok, 1 failed or dirty, 2 could not run")]
+[doc("Gate, build, smoke, publish release/ctxmode and tag v<version>. 0 ok, 1 failed or dirty, 2 could not run")]
 release:
   #!/usr/bin/env bash
   set -uo pipefail
@@ -99,6 +99,15 @@ release:
   sha256sum ctxmode > .ctxmode.sha256.incoming && mv .ctxmode.sha256.incoming ctxmode.sha256 || exit 2
   echo "released $(realpath ctxmode): $(./ctxmode --version)"
   cat ctxmode.sha256
+  # The tag marks a version's first release; a rebuild of it leaves the tag alone.
+  tag="v$(./ctxmode --version | awk '{print $2}')"
+  if at=$(git rev-parse -q --verify "refs/tags/$tag^{commit}"); then
+    [ "$at" = "$(git rev-parse HEAD)" ] && echo "$tag already tags HEAD" \
+      || echo "$tag already tags ${at:0:12}; bump package.json to tag this build"
+  else
+    git tag -a "$tag" -m "ctxmode $tag" || exit 2
+    echo "tagged $tag; \`git push --follow-tags\` publishes it"
+  fi
 
 # --- the fleet -----------------------------------------------------------
 

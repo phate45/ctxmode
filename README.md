@@ -13,7 +13,7 @@ ctxmode is a hard fork of [mksglu/context-mode](https://github.com/mksglu/contex
 
 ```bash
 bun install
-just release          # gate -> build -> smoke -> release/ctxmode + .sha256
+just release          # gate -> build -> smoke -> release/ctxmode + .sha256, tag v<version>
 ```
 
 Install `release/ctxmode` somewhere stable (the fleet uses `~/.local/share/ctxmode/bin/ctxmode`) and register it in a project's `.mcp.json`:
@@ -283,7 +283,7 @@ Custom profiles take priority over all hardcoded defaults. You can override the 
 | `just gate` | Typecheck and tests, including the golden parity check |
 | `just build` | Compile `release/build/ctxmode`, check its glibc floor and linked libraries |
 | `just smoke` | Golden check, `--version` and a hook round-trip against the compiled binary |
-| `just release` | gate, build, smoke, then publish `release/ctxmode` and its `.sha256` |
+| `just release` | gate, build, smoke, then publish `release/ctxmode` and its `.sha256`, and tag `v<version>` if that version has no tag |
 | `just fleet-ready ctxmode` / `just artifact` | Version, and path of a release that is current with HEAD, for fleet delivery |
 
 `ctxmode --version` prints the package version and the git SHA it was built from.

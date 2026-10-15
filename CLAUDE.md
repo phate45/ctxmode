@@ -58,11 +58,11 @@ Preprocessing: `stripFrontmatter`, `prefixDates` (for `YYYY-MM-DD.md`), and blan
 
 ## The loop
 
-`just gate` → commit → `just release` → push. Exit codes are the interface: `0` ok, `1` action needed, `2` could not run.
+`just gate` → commit → `just release` → `git push --follow-tags`. Exit codes are the interface: `0` ok, `1` action needed, `2` could not run.
 
 - `just gate` is the bar for every commit: typecheck, unit/e2e tests, and the golden check.
 - A deliberate behaviour change shows up as a golden mismatch. List it in `test/golden/expected-differences.json` with a reason; never re-record `expected.json` to hide one.
-- `just release` publishes `release/ctxmode` + `.sha256` only after the compiled binary passes smoke. Fleet takes it through `just fleet-ready ctxmode` and `just artifact`.
+- `just release` publishes `release/ctxmode` + `.sha256` only after the compiled binary passes smoke, and tags a version's first release `v<version>`; the fleet watches those tags as ctxmode's upstream. Fleet takes it through `just fleet-ready ctxmode` and `just artifact`.
 
 **Done means released.** A change is finished when `just gate` passes on its commit, `origin/master` carries it, and `just release` has published a binary built from that commit.
 
