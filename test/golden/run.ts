@@ -37,8 +37,8 @@ export async function startServer(cmd: string[], cwd: string, home: string): Pro
     // Keeps upstream auto-memory and session dirs away from the real ~/.claude.
     CLAUDE_CONFIG_DIR: join(home, ".claude"),
     // The flood guard would otherwise cap results at 1 and block after 8 calls.
-    CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER: "1000",
-    CONTEXT_MODE_SEARCH_BLOCK_AFTER: "1000",
+    CTXMODE_SEARCH_MAX_RESULTS_AFTER: "1000",
+    CTXMODE_SEARCH_BLOCK_AFTER: "1000",
   });
 
   const [command, ...rest] = cmd;

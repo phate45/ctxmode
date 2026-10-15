@@ -331,7 +331,7 @@ export class ContentStore {
 
   constructor(dbPath?: string) {
     this.#dbPath =
-      dbPath ?? join(tmpdir(), `context-mode-${process.pid}.db`);
+      dbPath ?? join(tmpdir(), `ctxmode-${process.pid}.db`);
     cleanOrphanedWALFiles(this.#dbPath);
     let db: DatabaseInstance;
     try {

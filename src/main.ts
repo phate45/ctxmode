@@ -9,7 +9,7 @@ switch (command) {
       await (await import("./server.ts")).serve();
     } catch (err) {
       const e = err as Error;
-      stderr.write(`[context-wrapper] Fatal: ${e.message}\n${e.stack}\n`);
+      stderr.write(`[ctxmode] Fatal: ${e.message}\n${e.stack}\n`);
       exit(1);
     }
     break;

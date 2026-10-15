@@ -1,9 +1,9 @@
 {
-  "name": "context-wrapper",
+  "name": "ctxmode",
   "version": "0.2.0",
   "type": "module",
   "private": true,
-  "description": "Pre-warm wrapper for context-mode MCP server — indexes vault notes on startup",
+  "description": "Context-saving MCP server: sandboxed execution and a pre-warmed FTS5 knowledge base",
   "license": "Elastic-2.0",
   "scripts": {
     "start": "bun src/main.ts",

@@ -1,7 +1,7 @@
 /**
- * Pre-warm + markdown ingest helpers for context-wrapper.
+ * Pre-warm + markdown ingest helpers for ctxmode.
  *
- * Discovers .claude/context-mode.json, resolves source files, applies our
+ * Discovers .claude/ctxmode.json, resolves source files, applies our
  * markdown-specific preprocessing, and indexes into the FTS5 content
  * database so search() works immediately.
  */
@@ -64,7 +64,7 @@ export interface IndexPathOptions {
 // Env var pointing at an exact config file. When set, the upward walk is
 // skipped and the file is loaded verbatim; an unreadable or invalid file is a
 // hard error rather than a silent fallback, since setting it signals intent.
-export const CONFIG_ENV_VAR = "CONTEXT_WRAPPER_CONFIG";
+export const CONFIG_ENV_VAR = "CTXMODE_CONFIG";
 
 export interface FoundConfig {
   config: Config;
@@ -102,7 +102,7 @@ export function findConfig(startDir: string): FoundConfig | null {
   let dir = resolve(startDir);
 
   while (true) {
-    const candidate = join(dir, ".claude", "context-mode.json");
+    const candidate = join(dir, ".claude", "ctxmode.json");
     try {
       const raw = readFileSync(candidate, "utf-8");
       return { config: JSON.parse(raw), configPath: candidate, sourceBase: dir };
@@ -183,7 +183,7 @@ function resolveSourceFiles(source: SourceConfig, sourceBase: string): ResolvedF
       const paths = JSON.parse(output);
       if (!Array.isArray(paths)) {
         process.stderr.write(
-          `[context-wrapper] exec for "${source.label}" did not return an array\n`,
+          `[ctxmode] exec for "${source.label}" did not return an array\n`,
         );
         return [];
       }
@@ -193,7 +193,7 @@ function resolveSourceFiles(source: SourceConfig, sourceBase: string): ResolvedF
         .filter((f): f is ResolvedFile => f !== null);
     } catch (err: any) {
       process.stderr.write(
-        `[context-wrapper] exec for "${source.label}" failed: ${err.message}\n`,
+        `[ctxmode] exec for "${source.label}" failed: ${err.message}\n`,
       );
       return [];
     }
@@ -207,7 +207,7 @@ function resolveSourceFiles(source: SourceConfig, sourceBase: string): ResolvedF
   }
 
   process.stderr.write(
-    `[context-wrapper] source "${source.label}" has no file selection strategy (need glob+path, exec, or paths)\n`,
+    `[ctxmode] source "${source.label}" has no file selection strategy (need glob+path, exec, or paths)\n`,
   );
   return [];
 }

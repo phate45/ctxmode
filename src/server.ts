@@ -56,11 +56,11 @@ let searchReminder: false | string | undefined;
 
 // Prevent silent MCP server death from unhandled async errors.
 process.on("unhandledRejection", (err) => {
-  process.stderr.write(`[context-mode] unhandledRejection: ${err}\n`);
+  process.stderr.write(`[ctxmode] unhandledRejection: ${err}\n`);
 });
 process.on("uncaughtException", (err) => {
   try {
-    writeSync(2, `[context-mode] uncaughtException: ${err?.message ?? err}\n`);
+    writeSync(2, `[ctxmode] uncaughtException: ${err?.message ?? err}\n`);
   } finally {
     process.exit(1);
   }
@@ -68,7 +68,7 @@ process.on("uncaughtException", (err) => {
 
 const runtimes = detectRuntimes();
 export const server = new McpServer({
-  name: "context-wrapper",
+  name: "ctxmode",
   version: pkg.version,
 });
 
@@ -94,7 +94,7 @@ export function getProjectDir(): string {
 }
 
 // A fresh content DB per process, removed on exit.
-const storageRoot = mkdtempSync(join(tmpdir(), "context-mode-"));
+const storageRoot = mkdtempSync(join(tmpdir(), "ctxmode-"));
 process.on("exit", () => {
   if (_store) _store.close();
   try { rmSync(storageRoot, { recursive: true, force: true }); } catch { /* best effort */ }
@@ -1264,9 +1264,9 @@ function readPositiveEnv(name: string, defaultValue: number): number {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
 }
 
-const SEARCH_WINDOW_MS = readPositiveEnv("CONTEXT_MODE_SEARCH_WINDOW_MS", 60_000);
-const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER", 3); // after N calls: 1 result per query
-const SEARCH_BLOCK_AFTER = readPositiveEnv("CONTEXT_MODE_SEARCH_BLOCK_AFTER", 8); // after N calls: refuse, demand batching
+const SEARCH_WINDOW_MS = readPositiveEnv("CTXMODE_SEARCH_WINDOW_MS", 60_000);
+const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CTXMODE_SEARCH_MAX_RESULTS_AFTER", 3); // after N calls: 1 result per query
+const SEARCH_BLOCK_AFTER = readPositiveEnv("CTXMODE_SEARCH_BLOCK_AFTER", 8); // after N calls: refuse, demand batching
 
 const searchFloodGuard = new FloodGuard({
   windowMs: SEARCH_WINDOW_MS,
@@ -1590,7 +1590,7 @@ export function buildFetchCode(url: string, outputPath: string): string {
     classifyIpFnName === "classifyIp"
       ? `var classifyIp = ${classifyIpInner};`
       : `var ${classifyIpFnName} = ${classifyIpInner};\nvar classifyIp = ${classifyIpFnName};`;
-  const strictMode = process.env.CTX_FETCH_STRICT === "1";
+  const strictMode = process.env.CTXMODE_FETCH_STRICT === "1";
   return `
 const TurndownService = require(${turndownPath});
 const { gfm } = require(${gfmPath});
@@ -1884,7 +1884,7 @@ type FetchOneResult =
  *   - localhost, 127.x.x.x, ::1 (local dev servers — Next.js, Vite, Postgres, …)
  *   - 10.x, 172.16-31.x, 192.168.x RFC1918 private (developer's internal network)
  *
- * **STRICT MODE** opt-in via env var: `CTX_FETCH_STRICT=1`
+ * **STRICT MODE** opt-in via env var: `CTXMODE_FETCH_STRICT=1`
  *   - Blocks loopback + RFC1918 too
  *   - For hosted/CI environments where the runtime isn't the user's own machine
  *
@@ -1910,7 +1910,7 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
     };
   }
 
-  const strict = process.env.CTX_FETCH_STRICT === "1";
+  const strict = process.env.CTXMODE_FETCH_STRICT === "1";
 
   // 2. DNS resolve + check IP ranges (hard-block + optional strict-mode block)
   try {
@@ -1930,7 +1930,7 @@ async function ssrfGuard(rawUrl: string): Promise<FetchOneResult | null> {
         return {
           kind: "fetch_error",
           url: rawUrl,
-          error: `URL "${parsed.hostname}" resolves to private IP ${rec.address} — blocked under CTX_FETCH_STRICT=1`,
+          error: `URL "${parsed.hostname}" resolves to private IP ${rec.address} — blocked under CTXMODE_FETCH_STRICT=1`,
           reason: "exit",
         };
       }
@@ -2662,7 +2662,7 @@ export async function serve(): Promise<void> {
     const result = prewarm(configResult.config, getStorePath(), configResult.sourceBase);
     const elapsed = (performance.now() - start).toFixed(0);
     process.stderr.write(
-      `[context-wrapper] Pre-warmed ${result.totalChunks} chunks from ` +
+      `[ctxmode] Pre-warmed ${result.totalChunks} chunks from ` +
         `${result.totalSources} files in ${elapsed}ms (${getStorePath()})\n`,
     );
     const manifest = formatPrewarmManifest(result.sources);
@@ -2675,5 +2675,5 @@ export async function serve(): Promise<void> {
   process.stdin.on("end", () => process.exit(0));
 
   await server.connect(new StdioServerTransport());
-  process.stderr.write(`[context-wrapper] MCP server ready [tmp=${storageRoot}]\n`);
+  process.stderr.write(`[ctxmode] MCP server ready [tmp=${storageRoot}]\n`);
 }

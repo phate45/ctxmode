@@ -25,7 +25,7 @@ function write(path: string, content: string): void {
 async function connect(cwd: string, env: Record<string, string> = {}): Promise<Client> {
   const base: Record<string, string> = {};
   for (const [k, v] of Object.entries(process.env)) {
-    if (v !== undefined && !/^(CLAUDE|CONTEXT_MODE|CONTEXT_WRAPPER)/.test(k)) base[k] = v;
+    if (v !== undefined && !/^(CLAUDE|CONTEXT_MODE|CONTEXT_WRAPPER|CTXMODE)/.test(k)) base[k] = v;
   }
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -45,7 +45,7 @@ async function call(client: Client, name: string, args: Record<string, unknown>)
 }
 
 function config(root: string, cfg: object): void {
-  write(join(root, ".claude", "context-mode.json"), JSON.stringify(cfg));
+  write(join(root, ".claude", "ctxmode.json"), JSON.stringify(cfg));
 }
 
 describe("discovered config", async () => {
@@ -126,13 +126,13 @@ test("relative sources resolve against the config's project dir", async () => {
   }
 });
 
-test("CONTEXT_WRAPPER_CONFIG loads an exact file; relative paths follow the launch cwd", async () => {
+test("CTXMODE_CONFIG loads an exact file; relative paths follow the launch cwd", async () => {
   const root = tempRoot();
   const launch = join(root, "no-config");
   write(join(launch, "note.md"), "# Env\n\nenv-override-token-789\n");
   const cfg = join(root, "elsewhere", "ctx.json");
   write(cfg, JSON.stringify({ sources: [{ label: "envrelative", path: ".", glob: "*.md" }] }));
-  const client = await connect(launch, { CONTEXT_WRAPPER_CONFIG: cfg });
+  const client = await connect(launch, { CTXMODE_CONFIG: cfg });
   try {
     const r = await call(client, "search", { queries: ["env-override-token-789"] });
     expect(r.text).toContain("envrelative: note.md");
@@ -146,7 +146,7 @@ test("searchReminder false drops the throttle warning, a string replaces it", as
     const root = tempRoot();
     write(join(root, "a.md"), "# A\n\nreminder-token\n");
     config(root, { sources: [{ label: "a", path: ".", glob: "*.md" }], searchReminder: reminder });
-    const client = await connect(root, { CONTEXT_MODE_SEARCH_MAX_RESULTS_AFTER: "1", CONTEXT_MODE_SEARCH_BLOCK_AFTER: "2" });
+    const client = await connect(root, { CTXMODE_SEARCH_MAX_RESULTS_AFTER: "1", CTXMODE_SEARCH_BLOCK_AFTER: "2" });
     try {
       const soft = await call(client, "search", { queries: ["reminder-token"] });
       expect(soft.text).not.toContain("⚠ search call");

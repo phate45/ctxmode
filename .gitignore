@@ -12,6 +12,6 @@ __pycache__/
 .mcp.json
 CLAUDE.local.md
 .claude/settings.local.json
-.claude/context-mode.json
+.claude/ctxmode.json
 .plans/
 
