@@ -24,7 +24,7 @@ switch (command) {
     // Builds or refreshes the baseline for the config serve would load here.
     const { findConfig } = await import("./prewarm.ts");
     const { formatReport, prewarmSession, startSession } = await import("./cache.ts");
-    const { deleteDBFiles } = await import("./db-base.ts");
+    const { deleteDBFiles } = await import("./store.ts");
     try {
       const found = findConfig(cwd());
       if (!found) {

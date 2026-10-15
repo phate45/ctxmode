@@ -1,19 +1,8 @@
 // Vendored from mksglu/context-mode v1.0.169 (442f1eb) src/runPool.ts.
 /**
- * Generic in-flight-capped worker pool.
- *
- * Used by:
- *   - runBatchCommands (ctx_batch_execute parallel branch)
- *   - runBatchFetch    (ctx_fetch_and_index batch path)
- *
- * Returns Promise.allSettled-style results so one job's throw cannot
- * strand siblings. Caller maps fulfilled/rejected per index. Output
- * order is preserved by input index (not completion order).
- *
- * Designed to be the SINGLE concurrency primitive for the project —
- * all "run N independent operations with at most M in flight" needs
- * route here. Avoids the worker-pool copy-paste flagged in the
- * concurrency PRD architectural review (finding G).
+ * Run jobs with at most N in flight, for batch_execute and fetch_and_index.
+ * Results are allSettled-style in input order, so one job's throw cannot
+ * strand its siblings.
  */
 
 import { cpus } from "node:os";
@@ -27,8 +16,6 @@ export interface RunPoolOptions {
   concurrency: number;
   /** Optional: also clamp by `os.cpus().length` (memory-pressure safety). Default false. */
   capByCpuCount?: boolean;
-  /** Optional: per-settled callback (e.g. for progress reporting / metrics). */
-  onSettled?: (idx: number, result: PromiseSettledResult<unknown>) => void;
 }
 
 export interface RunPoolResult<T> {
@@ -44,7 +31,7 @@ export async function runPool<T>(
   jobs: PoolJob<T>[],
   opts: RunPoolOptions,
 ): Promise<RunPoolResult<T>> {
-  const { concurrency, capByCpuCount = false, onSettled } = opts;
+  const { concurrency, capByCpuCount = false } = opts;
 
   if (jobs.length === 0) {
     return { settled: [], effectiveConcurrency: 0, capped: false };
@@ -68,7 +55,6 @@ export async function runPool<T>(
       } catch (err) {
         settled[idx] = { status: "rejected", reason: err };
       }
-      onSettled?.(idx, settled[idx]);
     }
   }
 

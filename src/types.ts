@@ -1,20 +1,13 @@
 // Vendored from mksglu/context-mode v1.0.169 (442f1eb) src/types.ts.
 /**
- * types — Shared type definitions for context-mode packages.
- *
- * Contains interfaces shared by ContentStore and PolyglotExecutor.
- * Import from "./types.js".
+ * Types shared by ContentStore, PolyglotExecutor and the server.
  */
 
 // ─────────────────────────────────────────────────────────
 // Execution result
 // ─────────────────────────────────────────────────────────
 
-/**
- * Result returned by PolyglotExecutor after running a code snippet.
- * Shared here so SessionDB can record execution outcomes without importing
- * the full executor module.
- */
+/** Result returned by PolyglotExecutor after running a code snippet. */
 export interface ExecResult {
   stdout: string;
   stderr: string;
@@ -28,11 +21,7 @@ export interface ExecResult {
 // Content store shared types
 // ─────────────────────────────────────────────────────────
 
-/**
- * Result returned after indexing content into the knowledge base.
- * Shared so session tooling can record what was indexed without importing
- * ContentStore.
- */
+/** Result returned after indexing content into the knowledge base. */
 export interface IndexResult {
   sourceId: number;
   label: string;
@@ -40,10 +29,7 @@ export interface IndexResult {
   codeChunks: number;
 }
 
-/**
- * A single search result returned from FTS5 BM25-ranked lookup.
- * Shared for consumers that display or log results outside of ContentStore.
- */
+/** A single search result returned from FTS5 BM25-ranked lookup. */
 export interface SearchResult {
   title: string;
   content: string;

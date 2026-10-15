@@ -13,8 +13,8 @@ import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
-import { deleteDBFiles } from "./db-base.ts";
-import { ContentStore, STORE_VERSION } from "./store.ts";
+
+import { ContentStore, STORE_VERSION, deleteDBFiles } from "./store.ts";
 import {
   PREPROCESS_VERSION,
   preprocessText,
@@ -65,16 +65,15 @@ export interface PrewarmReport {
 
 // ── Locations ───────────────────────────────────────────────────────
 
-export function sessionsDir(): string {
-  return join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "ctxmode", "sessions");
-}
-
-/** Create the sessions dir, sweep DBs of dead processes, return this process's DB path. */
+/** Create the sessions dir, sweep DBs of dead processes, return this process's (empty) DB path. */
 export function startSession(): string {
-  const dir = sessionsDir();
+  const dir = join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "ctxmode", "sessions");
   mkdirSync(dir, { recursive: true });
   sweepDead(dir, /^(\d+)\.db(-wal|-shm)?$/);
-  return join(dir, `${process.pid}.db`);
+  const path = join(dir, `${process.pid}.db`);
+  // A crashed process that had this PID may have left its DB behind.
+  deleteDBFiles(path);
+  return path;
 }
 
 function pidAlive(pid: number): boolean {
@@ -230,7 +229,7 @@ export function prewarmSession(found: FoundConfig, sessionPath: string): Prewarm
   let writeBackError: string | undefined;
   let summary: { sources: PrewarmSourceSummary[]; files: number; chunks: number };
   try {
-    for (const stmt of MANIFEST_SCHEMA.split(";")) if (stmt.trim()) db.run(stmt);
+    db.run(MANIFEST_SCHEMA);
     const dirty = !warm || upserts.length > 0 || removed.length > 0;
     if (dirty) {
       db.transaction(() => {

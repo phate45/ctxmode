@@ -1,6 +1,6 @@
 // Vendored from mksglu/context-mode v1.0.169 (442f1eb) src/exit-classify.ts.
 /**
- * Classify non-zero exit codes for ctx_execute / ctx_execute_file.
+ * Classify non-zero exit codes for execute.
  *
  * Shell commands like `grep` exit 1 for "no matches" — not a real error.
  * We treat exit code 1 as a soft failure when:

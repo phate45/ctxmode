@@ -1,6 +1,6 @@
 // Vendored from mksglu/context-mode v1.0.169 (442f1eb) src/store.ts.
 /**
- * ContentStore — FTS5 BM25-based knowledge base for context-mode.
+ * ContentStore — FTS5 BM25-based knowledge base.
  *
  * Chunks markdown content by headings (keeping code blocks intact),
  * stores in SQLite FTS5, and retrieves via BM25-ranked search.
@@ -9,8 +9,8 @@
  * you need EXACT text later — not summaries.
  */
 
-import { openDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
-import type { DatabaseInstance, PreparedStatement } from "./db-base.js";
+import { Database, type Statement } from "bun:sqlite";
+import { unlinkSync } from "node:fs";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -169,6 +169,24 @@ const CHUNK_TITLE_MAX_CHARS = 80;
 // the slice, otherwise we'd waste too much of the byte budget.
 const WHITESPACE_BREAK_RATIO = 0.5;
 
+/** Delete a DB with its WAL and SHM files; missing files are fine. */
+export function deleteDBFiles(dbPath: string): void {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      unlinkSync(dbPath + suffix);
+    } catch { /* absent */ }
+  }
+}
+
+function openWAL(path: string): Database {
+  const db = new Database(path, { create: true });
+  db.run("PRAGMA journal_mode = WAL");
+  db.run("PRAGMA synchronous = NORMAL");
+  // FTS5 search is read-heavy; SQLite maps no more than the file's actual size.
+  db.run("PRAGMA mmap_size = 268435456");
+  return db;
+}
+
 // ─────────────────────────────────────────────────────────
 // ContentStore
 // ─────────────────────────────────────────────────────────
@@ -262,48 +280,47 @@ function findMinSpan(positionLists: number[][]): number {
 }
 
 export class ContentStore {
-  #db: DatabaseInstance;
-  #dbPath: string;
+  #db: Database;
 
   // ── Cached Prepared Statements ──
   // Prepared once at construction, reused on every call to avoid
   // re-compiling SQL on each invocation.
 
   // Write path
-  #stmtInsertSourceEmpty!: PreparedStatement;
-  #stmtInsertSource!: PreparedStatement;
-  #stmtInsertChunk!: PreparedStatement;
-  #stmtInsertChunkTrigram!: PreparedStatement;
-  #stmtInsertVocab!: PreparedStatement;
+  #stmtInsertSourceEmpty!: Statement;
+  #stmtInsertSource!: Statement;
+  #stmtInsertChunk!: Statement;
+  #stmtInsertChunkTrigram!: Statement;
+  #stmtInsertVocab!: Statement;
 
   // Dedup path (delete previous source with same label before re-indexing)
-  #stmtSourceIdsByLabel!: PreparedStatement;
-  #stmtDeleteChunksByRowid!: PreparedStatement;
-  #stmtDeleteChunksTrigramByRowid!: PreparedStatement;
-  #stmtDeleteSource!: PreparedStatement;
+  #stmtSourceIdsByLabel!: Statement;
+  #stmtDeleteChunksByRowid!: Statement;
+  #stmtDeleteChunksTrigramByRowid!: Statement;
+  #stmtDeleteSource!: Statement;
 
   // Search path (hot)
-  #stmtSearchPorter!: PreparedStatement;
-  #stmtSearchPorterFiltered!: PreparedStatement;
-  #stmtSearchPorterExact!: PreparedStatement;
-  #stmtSearchTrigram!: PreparedStatement;
-  #stmtSearchTrigramFiltered!: PreparedStatement;
-  #stmtSearchTrigramExact!: PreparedStatement;
-  #stmtFuzzyVocab!: PreparedStatement;
-  #stmtSearchPorterContentType!: PreparedStatement;
-  #stmtSearchPorterFilteredContentType!: PreparedStatement;
-  #stmtSearchPorterExactContentType!: PreparedStatement;
-  #stmtSearchTrigramContentType!: PreparedStatement;
-  #stmtSearchTrigramFilteredContentType!: PreparedStatement;
-  #stmtSearchTrigramExactContentType!: PreparedStatement;
+  #stmtSearchPorter!: Statement;
+  #stmtSearchPorterFiltered!: Statement;
+  #stmtSearchPorterExact!: Statement;
+  #stmtSearchTrigram!: Statement;
+  #stmtSearchTrigramFiltered!: Statement;
+  #stmtSearchTrigramExact!: Statement;
+  #stmtFuzzyVocab!: Statement;
+  #stmtSearchPorterContentType!: Statement;
+  #stmtSearchPorterFilteredContentType!: Statement;
+  #stmtSearchPorterExactContentType!: Statement;
+  #stmtSearchTrigramContentType!: Statement;
+  #stmtSearchTrigramFilteredContentType!: Statement;
+  #stmtSearchTrigramExactContentType!: Statement;
 
   // Read path
-  #stmtListSources!: PreparedStatement;
-  #stmtChunksBySource!: PreparedStatement;
-  #stmtSourceChunkCount!: PreparedStatement;
-  #stmtChunkContent!: PreparedStatement;
-  #stmtStats!: PreparedStatement;
-  #stmtSourceMeta!: PreparedStatement;
+  #stmtListSources!: Statement;
+  #stmtChunksBySource!: Statement;
+  #stmtSourceChunkCount!: Statement;
+  #stmtChunkContent!: Statement;
+  #stmtStats!: Statement;
+  #stmtSourceMeta!: Statement;
 
   // Fuzzy correction cache (process-local LRU). fuzzyCorrect() hits the vocab
   // DB and runs levenshtein against every candidate within length tolerance,
@@ -314,30 +331,14 @@ export class ContentStore {
   static readonly FUZZY_CACHE_SIZE = 256;
 
   constructor(dbPath: string) {
-    this.#dbPath = dbPath;
-    cleanOrphanedWALFiles(this.#dbPath);
-    let db: DatabaseInstance;
     try {
-      db = openDatabase(this.#dbPath, { timeout: 30000 });
-      applyWALPragmas(db);
+      this.#db = openWAL(dbPath);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (isSQLiteCorruptionError(msg)) {
-        deleteDBFiles(this.#dbPath);
-        cleanOrphanedWALFiles(this.#dbPath);
-        try {
-          db = openDatabase(this.#dbPath, { timeout: 30000 });
-          applyWALPragmas(db);
-        } catch (retryErr) {
-          throw new Error(
-            `Failed to create fresh DB after deleting corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
-          );
-        }
-      } else {
-        throw err;
-      }
+      // The store only holds derived content, so a corrupt file is rebuilt rather than repaired.
+      if (!/SQLITE_CORRUPT|SQLITE_NOTADB|malformed|not a database/.test(String(err))) throw err;
+      deleteDBFiles(dbPath);
+      this.#db = openWAL(dbPath);
     }
-    this.#db = db;
     this.#initSchema();
     this.#prepareStatements();
   }
@@ -636,7 +637,7 @@ export class ContentStore {
     const { content, source } = options;
     const label = source ?? "untitled";
     const chunks = this.#chunkMarkdown(content);
-    return withRetry(() => this.#insertChunks(chunks, label, content));
+    return this.#insertChunks(chunks, label, content);
   }
 
   // ── Index Plain Text ──
@@ -658,11 +659,11 @@ export class ContentStore {
 
     const chunks = this.#chunkPlainText(content, linesPerChunk, maxChunkBytes);
 
-    return withRetry(() => this.#insertChunks(
+    return this.#insertChunks(
       chunks.map((c) => ({ ...c, hasCode: false })),
       source,
       content,
-    ));
+    );
   }
 
   // ── Index JSON ──
@@ -697,7 +698,7 @@ export class ContentStore {
       return this.indexPlainText(content, source, undefined, maxChunkBytes);
     }
 
-    return withRetry(() => this.#insertChunks(chunks, source, content));
+    return this.#insertChunks(chunks, source, content);
   }
 
   // ── Shared DB Insertion ──
@@ -717,9 +718,7 @@ export class ContentStore {
       throw new Error(`refusing to index ${label}: ${chunks.length} chunks exceeds ${ROWID_SPAN - 1}`);
     }
 
-    // Atomic dedup + insert: delete previous source with same label,
-    // then insert new content — all within a single transaction.
-    // Prevents stale results in iterative workflows. (See: GitHub issue #67)
+    // Re-indexing a label replaces it in one transaction, so iterative runs never leave stale chunks.
     const transaction = this.#db.transaction(() => {
       this.#deleteByLabel(label);
 
@@ -794,12 +793,8 @@ export class ContentStore {
 
   #sourceFilterParam(source: string, sourceMatchMode: SourceMatchMode): string {
     if (sourceMatchMode === "exact") return source;
-    // Escape SQLite LIKE metacharacters so user-supplied source labels
-    // containing `_`, `%`, or `\` are matched literally rather than as
-    // wildcards. Backslash must be replaced first (otherwise subsequent
-    // escapes would themselves be re-escaped). Paired with `ESCAPE '\'`
-    // in the four prepared LIKE statements (#stmtSearchPorter*,
-    // #stmtSearchTrigram*). Regression: #646.
+    // `_`, `%` and `\` in a label match literally (the LIKE statements use ESCAPE '\');
+    // backslash goes first so the other escapes are not re-escaped.
     const escaped = source
       .replace(/\\/g, "\\\\")
       .replace(/%/g, "\\%")
@@ -817,7 +812,7 @@ export class ContentStore {
   ): SearchResult[] {
     const sanitized = sanitizeQuery(query, mode);
 
-    let stmt: PreparedStatement;
+    let stmt: Statement;
     let params: unknown[];
 
     if (source && contentType) {
@@ -838,7 +833,7 @@ export class ContentStore {
       params = [sanitized, limit];
     }
 
-    return withRetry(() => this.#mapSearchRows(stmt.all(...params) as SearchRow[]));
+    return this.#mapSearchRows(stmt.all(...params) as SearchRow[]);
   }
 
   // ── Trigram Search (Layer 2) ──
@@ -854,7 +849,7 @@ export class ContentStore {
     const sanitized = sanitizeTrigramQuery(query, mode);
     if (!sanitized) return [];
 
-    let stmt: PreparedStatement;
+    let stmt: Statement;
     let params: unknown[];
 
     if (source && contentType) {
@@ -875,7 +870,7 @@ export class ContentStore {
       params = [sanitized, limit];
     }
 
-    return withRetry(() => this.#mapSearchRows(stmt.all(...params) as SearchRow[]));
+    return this.#mapSearchRows(stmt.all(...params) as SearchRow[]);
   }
 
   // ── Fuzzy Correction (Layer 3) ──
@@ -1171,7 +1166,7 @@ export class ContentStore {
   }
 
   close(): void {
-    closeDB(this.#db); // WAL checkpoint before close — important for persistent DBs
+    this.#db.close();
   }
 
   // ── Vocabulary Extraction ──

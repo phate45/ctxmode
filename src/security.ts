@@ -1,14 +1,11 @@
 // Vendored from mksglu/context-mode v1.0.169 (442f1eb) src/security.ts.
 import { readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { relative, resolve, sep } from "node:path";
-
-import { resolveAdapterGlobalSettingsPaths } from "./util/claude-config.js";
 
 // ==============================================================================
 // Types
 // ==============================================================================
-
-export type PermissionDecision = "allow" | "deny" | "ask";
 
 export interface SecurityPolicy {
   allow: string[];
@@ -67,10 +64,7 @@ function convertGlobPart(glob: string): string {
  * - Colon: "tree:*" becomes /^tree(\s.*)?$/ (command with optional args)
  * - Space: "sudo *" becomes /^sudo .*$/  (literal glob match)
  */
-export function globToRegex(
-  glob: string,
-  caseInsensitive: boolean = false,
-): RegExp {
+export function globToRegex(glob: string): RegExp {
   let regexStr: string;
 
   const colonIdx = glob.indexOf(":");
@@ -87,7 +81,7 @@ export function globToRegex(
     regexStr = `^${convertGlobPart(glob)}$`;
   }
 
-  return new RegExp(regexStr, caseInsensitive ? "i" : "");
+  return new RegExp(regexStr);
 }
 
 /**
@@ -97,12 +91,8 @@ export function globToRegex(
  * space semantics), this handles file path globs where:
  * - `**` matches any number of path segments (including zero)
  * - `*` matches anything except path separators
- * - Paths are matched with forward slashes (callers normalize first)
  */
-export function fileGlobToRegex(
-  glob: string,
-  caseInsensitive: boolean = false,
-): RegExp {
+export function fileGlobToRegex(glob: string): RegExp {
   let regexStr = "";
   let i = 0;
 
@@ -132,22 +122,18 @@ export function fileGlobToRegex(
     }
   }
 
-  return new RegExp(`^${regexStr}$`, caseInsensitive ? "i" : "");
+  return new RegExp(`^${regexStr}$`);
 }
 
 /**
  * Check if a command matches any Bash pattern in the list.
  * Returns the matching pattern string, or null.
  */
-export function matchesAnyPattern(
-  command: string,
-  patterns: string[],
-  caseInsensitive: boolean = false,
-): string | null {
+export function matchesAnyPattern(command: string, patterns: string[]): string | null {
   for (const pattern of patterns) {
     const glob = parseBashPattern(pattern);
     if (!glob) continue;
-    if (globToRegex(glob, caseInsensitive).test(command)) return pattern;
+    if (globToRegex(glob).test(command)) return pattern;
   }
   return null;
 }
@@ -351,217 +337,56 @@ function readSingleSettings(path: string): SecurityPolicy | null {
   };
 }
 
-/**
- * Read Bash permission policies from up to 3 settings files.
- *
- * Returns policies in precedence order (most local first):
- *   1. .claude/settings.local.json  (project-local)
- *   2. .claude/settings.json        (project-shared)
- *   3. ~/.claude/settings.json      (global)
- *
- * Missing or invalid files are silently skipped.
- */
-export function readBashPolicies(
-  projectDir?: string,
-  globalSettingsPath?: string,
-): SecurityPolicy[] {
-  const policies: SecurityPolicy[] = [];
+/** Claude Code's settings files, most local first; CLAUDE_CONFIG_DIR moves the user-level one. */
+function settingsPaths(projectDir: string): string[] {
+  const env = process.env.CLAUDE_CONFIG_DIR?.trim();
+  const configDir = !env ? resolve(homedir(), ".claude")
+    : env.startsWith("~") ? resolve(homedir(), env.replace(/^~\/?/, ""))
+    : resolve(env);
+  return [
+    resolve(projectDir, ".claude", "settings.local.json"),
+    resolve(projectDir, ".claude", "settings.json"),
+    resolve(configDir, "settings.json"),
+  ];
+}
 
-  if (projectDir) {
-    const localPath = resolve(projectDir, ".claude", "settings.local.json");
-    const localPolicy = readSingleSettings(localPath);
-    if (localPolicy) policies.push(localPolicy);
-
-    const sharedPath = resolve(projectDir, ".claude", "settings.json");
-    const sharedPolicy = readSingleSettings(sharedPath);
-    if (sharedPolicy) policies.push(sharedPolicy);
-  }
-
-  // Issue #451 round-3: read settings from EVERY adapter-specific global path
-  // PLUS the claude global (defense in depth). When the caller passes an
-  // explicit globalSettingsPath we honor it verbatim (back-compat with tests
-  // and callers that already know which file to read).
-  const globalPaths =
-    globalSettingsPath !== undefined
-      ? [globalSettingsPath]
-      : resolveAdapterGlobalSettingsPaths();
-
-  for (const globalPath of globalPaths) {
-    const globalPolicy = readSingleSettings(globalPath);
-    if (globalPolicy) policies.push(globalPolicy);
-  }
-
-  return policies;
+/** Bash permission policies from every settings file that parses, most local first. */
+export function readBashPolicies(projectDir: string): SecurityPolicy[] {
+  return settingsPaths(projectDir).flatMap((path) => readSingleSettings(path) ?? []);
 }
 
 /**
- * Read deny patterns for a specific tool from settings files.
- *
- * Reads the same 3-tier settings as `readBashPolicies`, but extracts
- * only deny globs for the given tool. Used for Read and Grep enforcement
- * — checks if file paths should be blocked by deny patterns.
- *
- * Returns an array of arrays (one per settings file, in precedence order).
- * Each inner array contains the extracted glob strings.
+ * `permissions.{deny|allow}` globs for one tool, one array per settings file
+ * that parses, most local first.
  */
-export function readToolDenyPatterns(
-  toolName: string,
-  projectDir?: string,
-  globalSettingsPath?: string,
-): string[][] {
-  return readToolPermissionPatterns(toolName, "deny", projectDir, globalSettingsPath);
-}
-
-/**
- * Read `permissions.{deny|allow}` globs for a tool from every settings file in
- * precedence order (project local → project shared → adapter globals).
- *
- * Generalizes the original deny-only reader so the project-boundary guard
- * (#852) can consult the SAME `permissions.allow` rules the user already
- * maintains for the host's `Read` tool — instead of inventing a context-mode-
- * specific opt-out env that would rot into dead code. A user who legitimately
- * needs an out-of-project read expresses it once, in the host config, e.g.
- * `"permissions": { "allow": ["Read(/var/log/**)"] }`, and both the host and
- * context-mode honor it.
- */
-export function readToolPermissionPatterns(
-  toolName: string,
-  kind: "deny" | "allow",
-  projectDir?: string,
-  globalSettingsPath?: string,
-): string[][] {
+export function readToolPermissionPatterns(toolName: string, kind: "deny" | "allow", projectDir: string): string[][] {
   const result: string[][] = [];
-
-  const extractGlobs = (path: string): string[] | null => {
-    let raw: string;
-    try {
-      raw = readFileSync(path, "utf-8");
-    } catch {
-      return null;
-    }
-
+  for (const path of settingsPaths(projectDir)) {
     let parsed: any;
     try {
-      parsed = JSON.parse(raw);
+      parsed = JSON.parse(readFileSync(path, "utf-8"));
     } catch {
-      return null;
+      continue;
     }
-
     const entries = parsed?.permissions?.[kind];
-    if (!Array.isArray(entries)) return [];
-
+    if (!Array.isArray(entries)) {
+      result.push([]);
+      continue;
+    }
     const globs: string[] = [];
     for (const entry of entries) {
       if (typeof entry !== "string") continue;
       const tp = parseToolPattern(entry);
-      if (tp && tp.tool === toolName) {
-        globs.push(tp.glob);
-      }
+      if (tp && tp.tool === toolName) globs.push(tp.glob);
     }
-    return globs;
-  };
-
-  if (projectDir) {
-    const localGlobs = extractGlobs(
-      resolve(projectDir, ".claude", "settings.local.json"),
-    );
-    if (localGlobs !== null) result.push(localGlobs);
-
-    const sharedGlobs = extractGlobs(
-      resolve(projectDir, ".claude", "settings.json"),
-    );
-    if (sharedGlobs !== null) result.push(sharedGlobs);
+    result.push(globs);
   }
-
-  // Issue #451 round-3: union over every adapter-specific global path PLUS
-  // claude global. Each settings file contributes its own globs array entry
-  // so the precedence ordering downstream remains per-file rather than
-  // collapsed.
-  const globalPaths =
-    globalSettingsPath !== undefined
-      ? [globalSettingsPath]
-      : resolveAdapterGlobalSettingsPaths();
-
-  for (const globalPath of globalPaths) {
-    const globalGlobs = extractGlobs(globalPath);
-    if (globalGlobs !== null) result.push(globalGlobs);
-  }
-
   return result;
 }
 
 // ==============================================================================
 // Decision Engine
 // ==============================================================================
-
-interface CommandDecision {
-  decision: PermissionDecision;
-  matchedPattern?: string;
-}
-
-/**
- * Evaluate a command against policies in precedence order.
- *
- * Splits chained commands (&&, ||, ;, |) and checks each segment
- * against deny patterns — prevents bypassing deny by prepending
- * innocent commands like "echo ok && sudo rm -rf /".
- *
- * Within each policy: deny > ask > allow (most restrictive wins).
- * First definitive match across policies wins.
- * Default (no match in any policy): "ask".
- */
-export function evaluateCommand(
-  command: string,
-  policies: SecurityPolicy[],
-  caseInsensitive: boolean = process.platform === "win32" || process.platform === "darwin",
-): CommandDecision {
-  // Extract all main segments and nested subshell commands
-  const allCommands = collectCommandElements(command);
-
-  // 1. Deny check: If ANY segment or subshell command is denied, block the entire command
-  for (const cmdElement of allCommands) {
-    for (const policy of policies) {
-      const denyMatch = matchesAnyPattern(cmdElement, policy.deny, caseInsensitive);
-      if (denyMatch) return { decision: "deny", matchedPattern: denyMatch };
-    }
-  }
-
-  // 2. Allow/Ask check: Evaluate segment-by-segment in precedence order.
-  // The command is allowed if and only if EVERY segment and subshell is explicitly allowed.
-  // If any element matches an ask pattern or matches no allow pattern, it defaults to ask.
-  for (const policy of policies) {
-    let allAllowed = true;
-    let anyAsk = false;
-    let matchedAskPattern: string | undefined;
-    let matchedAllowPattern: string | undefined;
-
-    for (const cmdElement of allCommands) {
-      const askMatch = matchesAnyPattern(cmdElement, policy.ask, caseInsensitive);
-      if (askMatch) {
-        anyAsk = true;
-        matchedAskPattern = askMatch;
-        break; // Ask wins immediately within this policy
-      }
-
-      const allowMatch = matchesAnyPattern(cmdElement, policy.allow, caseInsensitive);
-      if (!allowMatch) {
-        allAllowed = false;
-      } else {
-        matchedAllowPattern = allowMatch;
-      }
-    }
-
-    if (anyAsk) {
-      return { decision: "ask", matchedPattern: matchedAskPattern };
-    }
-
-    if (allAllowed && allCommands.length > 0) {
-      return { decision: "allow", matchedPattern: matchedAllowPattern };
-    }
-  }
-
-  return { decision: "ask" };
-}
 
 /**
  * Server-side variant: only enforce deny patterns.
@@ -574,13 +399,12 @@ export function evaluateCommand(
 export function evaluateCommandDenyOnly(
   command: string,
   policies: SecurityPolicy[],
-  caseInsensitive: boolean = process.platform === "win32" || process.platform === "darwin",
 ): { decision: "deny" | "allow"; matchedPattern?: string } {
   const allCommands = collectCommandElements(command);
 
   for (const cmdElement of allCommands) {
     for (const policy of policies) {
-      const denyMatch = matchesAnyPattern(cmdElement, policy.deny, caseInsensitive);
+      const denyMatch = matchesAnyPattern(cmdElement, policy.deny);
       if (denyMatch) return { decision: "deny", matchedPattern: denyMatch };
     }
   }
@@ -593,193 +417,72 @@ export function evaluateCommandDenyOnly(
 // ==============================================================================
 
 /**
- * Check if a file path should be denied based on deny globs.
- *
- * Normalizes backslashes to forward slashes before matching so that
- * Windows paths work with Unix-style glob patterns.
- *
- * When `projectRoot` is supplied, the path is also matched in its
- * fully-resolved absolute form **and** — when the file exists — in
- * its canonical form (`fs.realpathSync`). This prevents two classes
- * of bypass:
- *
- *   1. `..` traversal: a relative path like `../../.ssh/id_rsa` no
- *      longer evades absolute-path deny rules.
- *   2. Symlink escape: a project-local path whose realpath points
- *      outside the project (e.g. `safe.log -> ~/.ssh/id_rsa`) no
- *      longer evades absolute-path deny rules.
- *
- * realpath is best-effort: if the file does not exist yet (ENOENT)
- * or the syscall fails for any reason, the lexical resolved form is
- * still checked. This keeps the function usable for paths that will
- * be created during execution.
+ * Does `filePath` match any of the globs? With `projectRoot`, the path is also
+ * matched in its resolved absolute form and, when it exists, its realpath, so
+ * neither `..` traversal nor a symlink out of the project evades an absolute
+ * glob. A path that does not exist yet is matched lexically.
  */
 export function evaluateFilePath(
   filePath: string,
   denyGlobs: string[][],
-  caseInsensitive: boolean = process.platform === "win32" || process.platform === "darwin",
   projectRoot?: string,
 ): { denied: boolean; matchedPattern?: string } {
-  const toForward = (path: string): string => path.replace(/\\/g, "/");
-
-  // Match against the raw input, the lexically-resolved absolute path,
-  // and the canonical (symlink-resolved) path when the file exists.
-  // Deduplicated so absolute inputs and paths that don't cross symlinks
-  // don't pay the matching cost multiple times.
-  const candidates = new Set<string>();
-  candidates.add(toForward(filePath));
+  const candidates = new Set([filePath]);
   if (projectRoot) {
     const lexical = resolve(projectRoot, filePath);
-    candidates.add(toForward(lexical));
+    candidates.add(lexical);
     try {
-      candidates.add(toForward(realpathSync(lexical)));
-    } catch {
-      // File does not exist yet, or realpath failed — rely on lexical form.
-    }
+      candidates.add(realpathSync(lexical));
+    } catch { /* does not exist yet */ }
   }
 
   for (const globs of denyGlobs) {
     for (const glob of globs) {
-      // Normalize the glob's path separators the same way candidates were
-      // normalized — otherwise a Windows absolute deny rule like
-      // `Read(C:\Users\...\secret.env)` parses with literal backslashes that
-      // never match a forward-slash candidate.
-      const regex = fileGlobToRegex(toForward(glob), caseInsensitive);
+      const regex = fileGlobToRegex(glob);
       for (const candidate of candidates) {
-        if (regex.test(candidate)) {
-          return { denied: true, matchedPattern: glob };
-        }
+        if (regex.test(candidate)) return { denied: true, matchedPattern: glob };
       }
     }
   }
-
   return { denied: false };
 }
 
 // ==============================================================================
-// Project-Boundary Containment (Issue #852)
+// Project-Boundary Containment
 // ==============================================================================
 
 /**
- * Pure, algorithmic (no-regex) test: does `filePath` resolve to a location
- * inside `projectRoot`?
- *
- * Issue #852 — `ctx_execute_file` previously fed its `path` argument straight
- * into `resolve(projectRoot, path)`. Because `path.resolve` lets an *absolute*
- * argument win outright, an agent could read any file on the host
- * (`/home/user/secret`, `/etc/passwd`) regardless of the project root, and
- * `../` traversal escaped just as easily. Claude Code's harness sandbox cannot
- * inspect MCP input params, so the user approving the MCP call could not see
- * that the path escaped the workspace. This guard re-anchors the path to the
- * project boundary.
- *
- * Containment is decided on the *resolved* form. When the file (or its parent
- * chain) exists, the symlink-canonical form is ALSO required to stay inside —
- * this closes the symlink-escape class (a project-local `safe.log` whose
- * realpath points at `~/.ssh/id_rsa`), mirroring `evaluateFilePath`.
- *
- * A path equal to the project root itself counts as inside. Comparison is
- * case-insensitive on Windows/macOS to match those filesystems' semantics.
- *
- * Returns `true` when `projectRoot` is falsy (no boundary to enforce) so the
- * caller's fail-open posture is preserved when the root cannot be resolved.
+ * Does `filePath` resolve inside `projectRoot`? The lexical form must, and
+ * when the file exists its realpath must too, so a project-local symlink to
+ * `~/.ssh/id_rsa` does not count as inside. The root itself counts as inside.
  */
-export function isPathInsideProject(
-  filePath: string,
-  projectRoot: string | undefined,
-  caseInsensitive: boolean = process.platform === "win32" || process.platform === "darwin",
-): boolean {
-  if (!projectRoot) return true;
-
+export function isPathInsideProject(filePath: string, projectRoot: string): boolean {
+  const within = (root: string, candidate: string): boolean => {
+    const rel = relative(root, candidate);
+    return rel !== ".." && !rel.startsWith(".." + sep);
+  };
   const root = resolve(projectRoot);
   const lexical = resolve(projectRoot, filePath);
-
-  const within = (root: string, candidate: string): boolean => {
-    let a = root;
-    let b = candidate;
-    if (caseInsensitive) {
-      a = a.toLowerCase();
-      b = b.toLowerCase();
-    }
-    if (a === b) return true;
-    // `path.relative` is pure string arithmetic — no regex. A candidate inside
-    // the root yields a relative path that neither starts with `..` (escapes
-    // upward) nor is absolute (a different drive/root on Windows that cannot be
-    // expressed relatively).
-    const rel = relative(a, b);
-    if (rel === "") return true;
-    if (rel === ".." || rel.startsWith(".." + sep)) return false;
-    if (isAbsoluteRel(rel)) return false;
-    return true;
-  };
-
-  // Lexical containment is the primary gate.
   if (!within(root, lexical)) return false;
-
-  // Defense-in-depth: when the path (or a parent) is a symlink that points
-  // outside the project, the canonical form must ALSO stay inside. Best-effort
-  // — a not-yet-created file (ENOENT) falls back to the lexical decision above.
   try {
-    const canonicalRoot = realpathSync(root);
-    const canonical = realpathSync(lexical);
-    if (!within(canonicalRoot, canonical)) return false;
+    return within(realpathSync(root), realpathSync(lexical));
   } catch {
-    /* file does not exist yet / realpath failed — lexical decision stands */
+    return true; // does not exist yet: the lexical decision stands
   }
-
-  return true;
-}
-
-/** Pure helper: is a `path.relative` result an absolute path? (no regex) */
-function isAbsoluteRel(rel: string): boolean {
-  if (rel.startsWith("/")) return true; // POSIX absolute
-  // Windows drive-absolute: "C:\..." or "C:/..."
-  if (rel.length >= 3 && rel[1] === ":" && (rel[2] === "\\" || rel[2] === "/")) {
-    const c = rel.charCodeAt(0);
-    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122);
-  }
-  return false;
 }
 
 /**
- * Decide whether `filePath` may be processed, given the project boundary AND
- * the user's existing host `Read(...)` allow rules.
- *
- * Decision order:
- *   1. Inside the project root  → allowed (the common case; no config needed).
- *   2. Outside the project, but matching a `permissions.allow` `Read(...)` glob
- *      the user already configured for the host → allowed. This is the
- *      principled escape hatch: a deliberate out-of-project read is expressed
- *      ONCE in the host config the user already maintains, reusing the same
- *      mechanism Claude Code itself uses to whitelist a path outside the
- *      sandbox — no context-mode-specific opt-out env that would rot into
- *      dead code.
- *   3. Outside the project, no allow match → denied (closes the #852 escape).
- *
- * `allowGlobs` has the same per-settings-file shape as the deny globs returned
- * by `readToolPermissionPatterns(toolName, "allow", …)`. Allow-matching reuses
- * `evaluateFilePath` so absolute/`..`/symlink-canonical candidate resolution is
- * identical to the deny path — one matcher, no divergence.
- *
- * Fail-open on an unknown project root (boundary cannot be computed) so the
- * guard never blocks legitimate in-project work when resolution fails.
+ * May `filePath` be processed? Inside the project root it may; outside, only
+ * when a Read allow rule the user already keeps for Claude Code matches it.
  */
 export function evaluateProjectContainment(
   filePath: string,
-  projectRoot: string | undefined,
+  projectRoot: string,
   allowGlobs: string[][] = [],
-  caseInsensitive: boolean = process.platform === "win32" || process.platform === "darwin",
 ): { allowed: boolean; reason: "inside" | "allow-rule" | "outside" } {
-  if (isPathInsideProject(filePath, projectRoot, caseInsensitive)) {
-    return { allowed: true, reason: "inside" };
-  }
-  // Outside the project — permit only if the user explicitly allowed this path
-  // for the host Read tool. `evaluateFilePath` returns `denied:true` when a glob
-  // MATCHES, so a match here means "explicitly allowed".
-  if (allowGlobs.some((g) => g.length > 0)) {
-    const matched = evaluateFilePath(filePath, allowGlobs, caseInsensitive, projectRoot);
-    if (matched.denied) return { allowed: true, reason: "allow-rule" };
-  }
+  if (isPathInsideProject(filePath, projectRoot)) return { allowed: true, reason: "inside" };
+  // evaluateFilePath reports a match as `denied`; against allow globs that means allowed.
+  if (evaluateFilePath(filePath, allowGlobs, projectRoot).denied) return { allowed: true, reason: "allow-rule" };
   return { allowed: false, reason: "outside" };
 }
 
@@ -805,23 +508,6 @@ const SHELL_ESCAPE_PATTERNS: Record<string, RegExp[]> = {
   typescript: [
     /exec(?:Sync|File|FileSync)?\(\s*(['"`])(.*?)\1/g,
     /spawn(?:Sync)?\(\s*(['"`])(.*?)\1/g,
-  ],
-  ruby: [
-    /system\(\s*(['"])(.*?)\1/g,
-    /`(.*?)`/g,
-  ],
-  go: [
-    /exec\.Command\(\s*(['"`])(.*?)\1/g,
-  ],
-  php: [
-    /shell_exec\(\s*(['"`])(.*?)\1/g,
-    /(?:^|[^.])exec\(\s*(['"`])(.*?)\1/g,
-    /(?:^|[^.])system\(\s*(['"`])(.*?)\1/g,
-    /passthru\(\s*(['"`])(.*?)\1/g,
-    /proc_open\(\s*(['"`])(.*?)\1/g,
-  ],
-  rust: [
-    /Command::new\(\s*(['"`])(.*?)\1/g,
   ],
 };
 
@@ -872,9 +558,7 @@ export function extractShellCommands(
 
       let match: RegExpExecArray | null;
       while ((match = pattern.exec(code)) !== null) {
-        // The command string is in the last capture group that isn't the
-        // quote delimiter. For patterns with 2 groups (quote + content),
-        // it's group 2. For Ruby backticks with 1 group, it's group 1.
+        // The command string is the last capture group; the first is its quote.
         const command = match[match.length - 1];
         if (command) commands.push(command);
       }

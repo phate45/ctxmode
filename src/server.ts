@@ -7,10 +7,10 @@ import { randomBytes } from "node:crypto";
 import { cpus } from "node:os";
 import { z } from "zod";
 import pkg from "../package.json";
-import { PolyglotExecutor, type Language } from "./executor.js";
+import { PolyglotExecutor, type ExecResult, type Language } from "./executor.js";
 import { runPool, type PoolJob } from "./runPool.js";
-import { ContentStore } from "./store.js";
-import { deleteDBFiles } from "./db-base.js";
+import { ContentStore, deleteDBFiles, type IndexResult } from "./store.js";
+
 import { formatReport, prewarmSession, startSession } from "./cache.js";
 import { checkUrl, fetchLabel, fetchUrl, type Fetched } from "./fetch.js";
 import {
@@ -22,15 +22,13 @@ import {
   evaluateProjectContainment,
 } from "./security.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
-import { charSafePrefix } from "./truncate.js";
-import { FloodGuard } from "./search/flood-guard.js";
 import { findConfig, formatPrewarmManifest, preprocessText, walkDir, type FoundConfig } from "./prewarm.js";
 
 const TOOL_DESCRIPTIONS = {
   execute:
-    "Run code in the upstream sandbox. Use for derivation over files, command output, or fetched data without dumping raw bytes into context. When `path` is provided, the file is exposed inside the sandbox as FILE_CONTENT.",
+    "Run code in a subprocess and return what it prints. Use for derivation over files, command output, or fetched data without dumping raw bytes into context. When `path` is provided, the file's text is available to the code as FILE_CONTENT.",
   index:
-    "Store content in the searchable BM25 knowledge base. When `content` is provided, it is indexed directly. When `path` is provided, the wrapper reads files relative to the agent cwd, applies markdown preprocessing, and indexes each file as its own source.",
+    "Store content in the searchable BM25 knowledge base. When `content` is provided, it is indexed directly. When `path` is provided, ctxmode reads the file, or the matching files under a directory, relative to the working directory, applies markdown preprocessing, and indexes each file as its own source.",
   search:
     "Search indexed content with BM25/FTS5 ranking. Use after prewarm, index, fetch_and_index, batch_execute, or batch_read. Scope with `source` when you want results from a specific label or batch.",
   fetch_and_index:
@@ -59,14 +57,12 @@ process.on("uncaughtException", (err) => {
   }
 });
 
-export const server = new McpServer({
+const server = new McpServer({
   name: "ctxmode",
   version: pkg.version,
 });
 
-// Register empty prompts/resources handlers so MCP clients don't get -32601 (#168).
-// OpenCode calls listPrompts()/listResources() unconditionally — the error can poison
-// the SDK transport layer, causing subsequent listTools() calls to fail permanently.
+// Clients that list prompts and resources unconditionally get empty lists, not -32601.
 import { ListPromptsRequestSchema, ListResourcesRequestSchema, ListResourceTemplatesRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 server.server.registerCapabilities({ prompts: { listChanged: false }, resources: { listChanged: false } });
 server.server.setRequestHandler(ListPromptsRequestSchema, async () => ({ prompts: [] }));
@@ -75,28 +71,12 @@ server.server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => 
 
 const executor = new PolyglotExecutor();
 
-// Lazy singleton — no DB overhead unless index/search is used
-let _store: ContentStore | null = null;
-
-export function getProjectDir(): string {
-  return process.cwd();
-}
-
 // A session DB per process, removed on exit without the close-time optimize.
 const sessionPath = startSession();
 process.on("exit", () => deleteDBFiles(sessionPath));
 
-function getStorePath(): string {
-  return sessionPath;
-}
-
-function getStore(): ContentStore {
-  if (!_store) {
-    const dbPath = getStorePath();
-    _store = new ContentStore(dbPath);
-  }
-  return _store;
-}
+let store: ContentStore | null = null;
+const getStore = (): ContentStore => (store ??= new ContentStore(sessionPath));
 
 type ToolResult = {
   content: Array<{ type: "text"; text: string }>;
@@ -108,57 +88,26 @@ type ToolResult = {
 // ==============================================================================
 
 /**
- * Check a shell command against Bash deny patterns.
- * Returns an error ToolResult if denied, or null if allowed.
+ * A deny result when shell code, or a shell command embedded in other code,
+ * matches a Bash deny rule. Fails open: Claude Code's hooks are the primary
+ * enforcement layer.
  */
-function checkDenyPolicy(
-  command: string,
-): ToolResult | null {
+function checkDenyPolicy(code: string, language: Language): ToolResult | null {
   try {
-    const policies = readBashPolicies(getProjectDir());
-    const result = evaluateCommandDenyOnly(command, policies);
-    if (result.decision === "deny") {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `Command blocked by security policy: matches deny pattern ${result.matchedPattern}`,
-        }],
-        isError: true,
-      };
-    }
-  } catch {
-    // Security check failed — allow through (fail-open for server,
-    // hooks are the primary enforcement layer)
-  }
-  return null;
-}
-
-/**
- * Check non-shell code for shell-escape calls against deny patterns.
- */
-function checkNonShellDenyPolicy(
-  code: string,
-  language: string,
-): ToolResult | null {
-  try {
-    const commands = extractShellCommands(code, language);
+    const commands = language === "shell" ? [code] : extractShellCommands(code, language);
     if (commands.length === 0) return null;
-    const policies = readBashPolicies(getProjectDir());
+    const policies = readBashPolicies(process.cwd());
     for (const cmd of commands) {
       const result = evaluateCommandDenyOnly(cmd, policies);
       if (result.decision === "deny") {
+        const what = language === "shell" ? "" : `embedded shell command "${cmd}" `;
         return {
-          content: [{
-            type: "text" as const,
-            text: `Command blocked by security policy: embedded shell command "${cmd}" matches deny pattern ${result.matchedPattern}`,
-          }],
+          content: [{ type: "text" as const, text: `Command blocked by security policy: ${what}matches deny pattern ${result.matchedPattern}` }],
           isError: true,
         };
       }
     }
-  } catch {
-    // Fail-open
-  }
+  } catch { /* fail-open */ }
   return null;
 }
 
@@ -177,7 +126,7 @@ function guardPath(path: string, forExecute = false): { path: string; text: stri
     if (forExecute && !evaluateProjectContainment(path, dir, readToolPermissionPatterns("Read", "allow", dir)).allowed) {
       return { path: abs, error: `resolves outside the project root (${dir}); to allow it, add "Read(${abs})" to permissions.allow in your Claude Code settings` };
     }
-    const deny = evaluateFilePath(path, readToolPermissionPatterns("Read", "deny", dir), false, dir);
+    const deny = evaluateFilePath(path, readToolPermissionPatterns("Read", "deny", dir), dir);
     if (deny.denied) return { path: abs, error: `blocked by Read deny policy ${deny.matchedPattern}` };
   } catch { /* fail-open: an unreadable settings file must not block in-project work */ }
   let fd: number | undefined;
@@ -214,7 +163,7 @@ const ETX = "\x03";
  * original (marker-free) text. Returns character offsets into the
  * stripped content where each matched token begins.
  */
-export function positionsFromHighlight(highlighted: string): number[] {
+function positionsFromHighlight(highlighted: string): number[] {
   const positions: number[] = [];
   let cleanOffset = 0;
 
@@ -239,12 +188,7 @@ export function positionsFromHighlight(highlighted: string): number[] {
   return positions;
 }
 
-/** Strip STX/ETX markers to recover original content. */
-function stripMarkers(highlighted: string): string {
-  return highlighted.replaceAll(STX, "").replaceAll(ETX, "");
-}
-
-export function extractSnippet(
+function extractSnippet(
   content: string,
   query: string,
   maxLen = 1500,
@@ -313,9 +257,9 @@ export function extractSnippet(
   return parts.join("\n\n");
 }
 
-export type BatchQueryScope = "batch" | "global";
+type BatchQueryScope = "batch" | "global";
 
-export function formatBatchQueryResults(
+function formatBatchQueryResults(
   store: ContentStore,
   queries: string[],
   source: string,
@@ -368,19 +312,15 @@ export function formatBatchQueryResults(
 // batch_execute runner — used by batch_execute handler
 // ─────────────────────────────────────────────────────────
 
-export interface BatchCommand { label: string; command: string; }
+interface BatchCommand { label: string; command: string; }
 
-export interface BatchRunResult {
+interface BatchRunResult {
   outputs: string[];
   timedOut: boolean;
 }
 
-export interface BatchRunOptions {
-  /**
-   * Total budget (concurrency=1, shared) or per-command (concurrency>1).
-   * When `undefined`, no server-side timer fires — the MCP host's RPC
-   * timeout governs (Issue #406).
-   */
+interface BatchRunOptions {
+  /** Shared budget (concurrency=1) or per command (concurrency>1); undefined leaves timing to the MCP host. */
   timeout: number | undefined;
   concurrency: number;
   cwd?: string;
@@ -390,11 +330,7 @@ interface BatchExecutor {
   execute(input: { language: "shell"; code: string; timeout: number | undefined; cwd?: string }): Promise<{ stdout: string; timedOut?: boolean }>;
 }
 
-/**
- * Per-section budget for the echoed `$ <command>` line so a 50KB heredoc
- * payload cannot dominate the response body. The full command always reaches
- * the executor — only the echo is clipped (Issues #717 + #736).
- */
+/** The echoed `$ <command>` line is clipped so a large heredoc cannot dominate the response; the command runs in full. */
 const COMMAND_ECHO_MAX = 500;
 
 function truncateCommandForEcho(command: string): string {
@@ -404,13 +340,7 @@ function truncateCommandForEcho(command: string): string {
 }
 
 
-/**
- * Per-call budget for the source-code echo prepended by `execute` and
- * `execute` (Issues #717 + #736). The full code always reaches the
- * sandbox — only the echo is clipped so massive payloads don't dominate
- * the response. Multi-line preserved (unlike command echo) so the user
- * sees the actual program shape.
- */
+/** The code echo is clipped the same way, but keeps its lines so the program's shape stays readable. */
 const CODE_ECHO_MAX = 2000;
 
 function truncateCodeForEcho(code: string): string {
@@ -418,11 +348,7 @@ function truncateCodeForEcho(code: string): string {
   return code.slice(0, CODE_ECHO_MAX) + "\n… (truncated)";
 }
 
-/**
- * Build the source-code preamble surfaced before tool stdout. Provenance
- * survives in indexed chunks (FTS5 sees the fenced block) so later
- * search hits remember what ran.
- */
+/** The code that ran, fenced above its output, so indexed chunks keep their provenance. */
 function buildExecuteEcho(language: string, code: string, path?: string): string {
   const header = path ? `path=${path}\n` : "";
   const fenced = `\`\`\`${language}\n${truncateCodeForEcho(code)}\n\`\`\``;
@@ -431,9 +357,6 @@ function buildExecuteEcho(language: string, code: string, path?: string): string
 
 function formatCommandOutput(label: string, command: string, raw: string): string {
   const output = raw || "(no output)";
-  // Echo the executed command below the section heading so per-chunk
-  // indexed content retains provenance for later search hits
-  // (Issues #717 + #736).
   const echoed = truncateCommandForEcho(command);
   return `# ${label}\n\n$ ${echoed}\n\n${output}\n`;
 }
@@ -453,7 +376,7 @@ function combineExecOutput(result: { stdout?: string; stderr?: string }): string
  * full timeout, output is collated by input index, and per-command timeouts
  * record `(timed out)` blocks without skipping siblings.
  */
-export async function runBatchCommands(
+async function runBatchCommands(
   commands: BatchCommand[],
   opts: BatchRunOptions,
   executor: BatchExecutor,
@@ -462,8 +385,6 @@ export async function runBatchCommands(
 
   if (concurrency <= 1) {
     // Serial path — shared timeout budget, cascading skip on timeout.
-    // When `timeout` is undefined, no shared budget is enforced; each
-    // command runs to completion (Issue #406).
     const outputs: string[] = [];
     const startTime = Date.now();
     let timedOut = false;
@@ -604,10 +525,8 @@ function coerceStringArray(val: unknown, field: string): CoerceResult {
 server.registerTool(
   "execute",
   {
-    // #852: surface code execution in the host approval prompt's title (the
-    // only server-controlled field the MCP permission UI renders besides args).
-    title: "Run code in a sandbox (executes the supplied code)",
-    // #846: runs arbitrary code in a sandbox with full network access.
+    // The title is what Claude Code's approval prompt shows besides the arguments.
+    title: "Run code in a subprocess (executes the supplied code)",
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
@@ -633,11 +552,6 @@ server.registerTool(
         .coerce.number()
         .optional()
         .describe("Max execution time in ms. When omitted, no server-side timer fires — the MCP host's RPC timeout governs (which is the right layer for this policy). Pass an explicit value for long-running builds (Gradle/Maven/SBT)."),
-      // background: wrapped in coerceBoolean preprocessor so the literal
-      // strings "true"/"false" arriving from OpenCode's native plugin
-      // bridge (and several LLM providers' tool-call JSON) parse as the
-      // boolean the handler expects. z.coerce.boolean() is unsafe here —
-      // Boolean("false") is true. Fixes #627.
       background: z
         .preprocess(coerceBoolean, z.boolean())
         .optional()
@@ -663,166 +577,71 @@ server.registerTool(
     }),
   },
   async ({ language, code, timeout, background, cwd, intent, path }) => {
-    if (path !== undefined) return executeFile({ path, language, code, timeout, intent });
-
-    // Security: deny-only firewall
-    if (language === "shell") {
-      const denied = checkDenyPolicy(code);
-      if (denied) return denied;
-    } else {
-      const denied = checkNonShellDenyPolicy(code, language);
-      if (denied) return denied;
+    if (path !== undefined) {
+      const guarded = guardPath(path, true);
+      if ("error" in guarded) {
+        return { content: [{ type: "text" as const, text: `File access blocked: "${path}" ${guarded.error}` }], isError: true };
+      }
     }
+    const denied = checkDenyPolicy(code, language);
+    if (denied) return denied;
 
     try {
-      // For JS/TS: wrap in an async function so top-level await works
-      let instrumentedCode = code;
-      if (language === "javascript" || language === "typescript") {
-        instrumentedCode = `async function __cm_main(){${code}
-}
-__cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nsetInterval(()=>{},2147483647);' : ''}`;
+      let result: ExecResult;
+      if (path !== undefined) {
+        result = await executor.executeFile({ path, language, code, timeout });
+      } else {
+        // An async wrapper allows top-level await; it opens on the code's first line so line numbers match.
+        const script = language === "javascript" || language === "typescript"
+          ? `async function __cm_main(){${code}\n}\n__cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? "\nsetInterval(()=>{},2147483647);" : ""}`
+          : code;
+        result = await executor.execute({ language, code: script, timeout, background, cwd });
       }
-      const effTimeout = timeout;
-      const result = await executor.execute({ language, code: instrumentedCode, timeout: effTimeout, background, cwd });
-
-      // Echo the executed source code before stdout so users can audit
-      // and tooling can block command patterns (Issues #717 + #736).
-      // Built from the user-supplied `code`, NOT the instrumented variant.
-      const echo = buildExecuteEcho(language, code);
-
-      if (result.timedOut) {
-        const partialOutput = result.stdout?.trim();
-        if (result.backgrounded && partialOutput) {
-          // Background mode: process is still running, return partial output as success
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `${echo}${partialOutput}\n\n_(process backgrounded after ${effTimeout}ms — still running)_`,
-              },
-            ],
-          };
-        }
-        if (partialOutput) {
-          // Timeout with partial output — return as success with note
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `${echo}${partialOutput}\n\n_(timed out after ${effTimeout}ms — partial output shown above)_`,
-              },
-            ],
-          };
-        }
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `${echo}Execution timed out after ${effTimeout}ms\n\nstderr:\n${result.stderr}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-
-      if (result.exitCode !== 0) {
-        const { isError, output } = classifyNonZeroExit({
-          language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
-        });
-        if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-          return {
-            content: [
-              { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`)}` },
-            ],
-            isError,
-          };
-        }
-        // Auto-index large error output into FTS5 — no data loss
-        if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-          return {
-            content: [
-              { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`)}` },
-            ],
-            isError,
-          };
-        }
-        return {
-          content: [
-            { type: "text" as const, text: `${echo}${output}` },
-          ],
-          isError,
-        };
-      }
-
-      const stdout = result.stdout || "(no output)";
-
-      // Intent-driven search: if intent provided and output is large enough
-      if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-        return {
-          content: [
-            { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `execute:${language}`)}` },
-          ],
-        };
-      }
-
-      // Auto-index large stdout into FTS5 — return pointer, not raw content
-      if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-        const indexed = indexStdout(stdout, `execute:${language}`);
-        // Prepend echo to the first text content so provenance still surfaces
-        const echoed = {
-          ...indexed,
-          content: indexed.content.map((c, i) =>
-            i === 0 && c.type === "text"
-              ? { ...c, text: `${echo}${(c as { text: string }).text}` }
-              : c,
-          ),
-        };
-        return echoed;
-      }
-
-      return {
-        content: [
-          { type: "text" as const, text: `${echo}${stdout}` },
-        ],
-      };
+      return shapeExecResult(result, {
+        echo: buildExecuteEcho(language, code, path),
+        language,
+        source: path !== undefined ? `file:${path}` : `execute:${language}`,
+        timeout,
+        intent,
+      });
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
-      return {
-        content: [
-          { type: "text" as const, text: `Runtime error: ${message}` },
-        ],
-        isError: true,
-      };
+      return { content: [{ type: "text" as const, text: `Runtime error: ${message}` }], isError: true };
     }
   },
 );
 
-// ─────────────────────────────────────────────────────────
-// Helper: index stdout into FTS5 knowledge base
-// ─────────────────────────────────────────────────────────
-
-function indexStdout(
-  stdout: string,
-  source: string,
-): { content: Array<{ type: "text"; text: string }> } {
-  const store = getStore();
-  const indexed = store.index({ content: stdout, source });
-  return {
-    content: [
-      {
-        type: "text" as const,
-        text: `Indexed ${indexed.totalChunks} sections (${indexed.codeChunks} with code) from: ${indexed.label}\nUse search(queries: ["..."]) to query this content. Use source: "${indexed.label}" to scope results.`,
-      },
-    ],
-  };
-}
-
-// ─────────────────────────────────────────────────────────
-// Helper: intent-driven search on execution output
-// ─────────────────────────────────────────────────────────
-
 const INTENT_SEARCH_THRESHOLD = 5_000; // bytes — ~80-100 lines
 const LARGE_OUTPUT_THRESHOLD = 102_400; // 100KB — auto-index into FTS5, return pointer
+
+/** The answer to an execute call: the echo, then the output, or for large output what was indexed and matched. */
+function shapeExecResult(
+  result: ExecResult,
+  { echo, language, source, timeout, intent }: { echo: string; language: Language; source: string; timeout?: number; intent?: string },
+): ToolResult {
+  const reply = (text: string, isError?: boolean): ToolResult => ({ content: [{ type: "text" as const, text: echo + text }], isError });
+  if (result.timedOut) {
+    const partial = result.stdout?.trim();
+    if (!partial) return reply(`Execution timed out after ${timeout}ms\n\nstderr:\n${result.stderr}`, true);
+    const note = result.backgrounded ? `process backgrounded after ${timeout}ms — still running` : `timed out after ${timeout}ms — partial output shown above`;
+    return reply(`${partial}\n\n_(${note})_`);
+  }
+  const { isError, output } = result.exitCode === 0
+    ? { isError: undefined, output: result.stdout || "(no output)" }
+    : classifyNonZeroExit({ language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr });
+  const label = isError ? `${source}:error` : source;
+  const bytes = Buffer.byteLength(output);
+  if (intent?.trim() && bytes > INTENT_SEARCH_THRESHOLD) return reply(intentSearch(output, intent, label), isError);
+  // Large output goes into the knowledge base instead of the context window.
+  if (bytes > LARGE_OUTPUT_THRESHOLD) {
+    return reply(result.exitCode === 0 ? indexedReply(getStore().index({ content: output, source })) : intentSearch(output, "errors failures exceptions", label), isError);
+  }
+  return reply(output, isError);
+}
+
+function indexedReply(r: IndexResult): string {
+  return `Indexed ${r.totalChunks} sections (${r.codeChunks} with code) from: ${r.label}\nUse search(queries: ["..."]) to query this content. Use source: "${r.label}" to scope results.`;
+}
 
 function intentSearch(
   stdout: string,
@@ -833,14 +652,10 @@ function intentSearch(
   const totalLines = stdout.split("\n").length;
   const totalBytes = Buffer.byteLength(stdout);
 
-  // Index into the PERSISTENT store so user can search() later
   const persistent = getStore();
   const indexed = persistent.indexPlainText(stdout, source);
-
-  // Search the persistent store directly (porter → trigram → fuzzy)
-  let results = persistent.searchWithFallback(intent, maxResults, source);
-
-  // Extract distinctive terms as vocabulary hints for the LLM
+  const results = persistent.searchWithFallback(intent, maxResults, source);
+  // Vocabulary hints let the agent phrase follow-up searches.
   const distinctiveTerms = persistent.getDistinctiveTerms(indexed.sourceId);
 
   if (results.length === 0) {
@@ -857,7 +672,7 @@ function intentSearch(
     return lines.join("\n");
   }
 
-  // Return ONLY titles + first-line previews — not full content
+  // Titles and first-line previews only, not full content.
   const lines = [
     `Indexed ${indexed.totalChunks} sections from "${source}" into knowledge base.`,
     `${results.length} sections matched "${intent}" (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB):`,
@@ -881,125 +696,6 @@ function intentSearch(
 }
 
 // ─────────────────────────────────────────────────────────
-// execute with `path`: run code over a file
-// ─────────────────────────────────────────────────────────
-
-async function executeFile({ path, language, code, timeout, intent }: {
-  path: string;
-  language: Language;
-  code: string;
-  timeout?: number;
-  intent?: string;
-}): Promise<ToolResult> {
-  const guarded = guardPath(path, true);
-  if ("error" in guarded) {
-    return { content: [{ type: "text" as const, text: `File access blocked: "${path}" ${guarded.error}` }], isError: true };
-  }
-
-  // Security: check code parameter against Bash deny patterns
-  if (language === "shell") {
-    const codeDenied = checkDenyPolicy(code);
-    if (codeDenied) return codeDenied;
-  } else {
-    const codeDenied = checkNonShellDenyPolicy(code, language);
-    if (codeDenied) return codeDenied;
-  }
-
-  try {
-    const effTimeout = timeout;
-    const result = await executor.executeFile({
-      path,
-      language,
-      code,
-      timeout: effTimeout,
-    });
-
-    // Echo path + executed source code before stdout for audit/debug
-    // (Issues #717 + #736).
-    const echo = buildExecuteEcho(language, code, path);
-
-    if (result.timedOut) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `${echo}Timed out processing ${path} after ${effTimeout}ms`,
-          },
-        ],
-        isError: true,
-      };
-    }
-
-    if (result.exitCode !== 0) {
-      const { isError, output } = classifyNonZeroExit({
-        language, exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr,
-      });
-      if (intent && intent.trim().length > 0 && Buffer.byteLength(output) > INTENT_SEARCH_THRESHOLD) {
-        return {
-          content: [
-            { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `file:${path}:error` : `file:${path}`)}` },
-          ],
-          isError,
-        };
-      }
-      // Auto-index large error output into FTS5 — no data loss
-      if (Buffer.byteLength(output) > LARGE_OUTPUT_THRESHOLD) {
-        return {
-          content: [
-            { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `file:${path}:error` : `file:${path}`)}` },
-          ],
-          isError,
-        };
-      }
-      return {
-        content: [
-          { type: "text" as const, text: `${echo}${output}` },
-        ],
-        isError,
-      };
-    }
-
-    const stdout = result.stdout || "(no output)";
-
-    if (intent && intent.trim().length > 0 && Buffer.byteLength(stdout) > INTENT_SEARCH_THRESHOLD) {
-      return {
-        content: [
-          { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `file:${path}`)}` },
-        ],
-      };
-    }
-
-    // Auto-index large stdout into FTS5 — return pointer, not raw content
-    if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-      const indexed = indexStdout(stdout, `file:${path}`);
-      const echoed = {
-        ...indexed,
-        content: indexed.content.map((c, i) =>
-          i === 0 && c.type === "text"
-            ? { ...c, text: `${echo}${(c as { text: string }).text}` }
-            : c,
-        ),
-      };
-      return echoed;
-    }
-
-    return {
-      content: [
-        { type: "text" as const, text: `${echo}${stdout}` },
-      ],
-    };
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    return {
-      content: [
-        { type: "text" as const, text: `Runtime error: ${message}` },
-      ],
-      isError: true,
-    };
-  }
-}
-
-// ─────────────────────────────────────────────────────────
 // Tool: index
 // ─────────────────────────────────────────────────────────
 
@@ -1007,8 +703,6 @@ server.registerTool(
   "index",
   {
     title: "Index Content",
-    // #846: writes content into the local FTS5 store (additive, not destructive;
-    // re-indexing the same content adds rows, so not idempotent). No network.
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1065,17 +759,7 @@ server.registerTool(
     }
 
     try {
-      const store = getStore();
-      const result = store.index({ content, source });
-
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Indexed ${result.totalChunks} sections (${result.codeChunks} with code) from: ${result.label}\nUse search(queries: ["..."]) to query this content. Use source: "${result.label}" to scope results.`,
-          },
-        ],
-      };
+      return { content: [{ type: "text" as const, text: indexedReply(getStore().index({ content, source })) }] };
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       return {
@@ -1171,27 +855,12 @@ const SEARCH_WINDOW_MS = readPositiveEnv("CTXMODE_SEARCH_WINDOW_MS", 60_000);
 const SEARCH_MAX_RESULTS_AFTER = readPositiveEnv("CTXMODE_SEARCH_MAX_RESULTS_AFTER", 3); // after N calls: 1 result per query
 const SEARCH_BLOCK_AFTER = readPositiveEnv("CTXMODE_SEARCH_BLOCK_AFTER", 8); // after N calls: refuse, demand batching
 
-const searchFloodGuard = new FloodGuard({
-  windowMs: SEARCH_WINDOW_MS,
-  softCapAfter: SEARCH_MAX_RESULTS_AFTER,
-  blockAfter: SEARCH_BLOCK_AFTER,
-});
+// Search calls in the current window; the window restarts once it is older than SEARCH_WINDOW_MS.
+let searchWindow = { start: 0, count: 0 };
 
 /**
- * Defensive coercion: parse stringified JSON arrays, AND lift a bare
- * non-empty string into a single-element array.
- *
- * Two shapes show up from the wild:
- *   1. `"[\"a\",\"b\"]"` — Claude Code double-serialization bug
- *      (https://github.com/anthropics/claude-code/issues/34520).
- *   2. `"single query"` — some LLM providers / OpenCode's native plugin
- *      bridge deliver a single string when the schema expects `string[]`
- *      (issue #627). v1.0.139 (#621) made the bridge run the Zod schema,
- *      so this now surfaces as `Expected array, received string`. The
- *      ergonomic recovery is to treat it as `["single query"]`.
- *
- * An empty string is intentionally NOT lifted — empty input should still
- * fail Zod's `.min(1)` check rather than masquerade as `[""]`.
+ * Accept an array param sent as a JSON-encoded string, or as one bare string
+ * (lifted to a one-element array). An empty string is left for zod to reject.
  */
 function coerceJsonArray(val: unknown): unknown {
   if (typeof val === "string") {
@@ -1200,26 +869,13 @@ function coerceJsonArray(val: unknown): unknown {
     try {
       const parsed = JSON.parse(val);
       if (Array.isArray(parsed)) return parsed;
-    } catch { /* fall through — not JSON, treat as bare-string lift */ }
-    // Bare-string lift (#627): single query delivered as a plain string.
+    } catch { /* not JSON: a bare value */ }
     return [val];
   }
   return val;
 }
 
-/**
- * Defensive coercion: accept the string literals "true"/"false" as
- * booleans. The OpenCode native plugin bridge (and several LLM providers'
- * tool-call JSON) stringifies primitives — `background:"false"` instead
- * of `background:false`, `confirm:"true"` instead of `confirm:true`.
- *
- * We deliberately do NOT use `z.coerce.boolean()` for boolean fields:
- * `Boolean("false")` is `true`, so Zod's coerce path silently flips the
- * meaning. This helper recognises only the documented literal forms and
- * passes anything else through untouched so Zod surfaces the right error.
- *
- * Fixes #627.
- */
+/** Accept "true"/"false" strings as booleans; z.coerce.boolean() would read "false" as true. */
 function coerceBoolean(val: unknown): unknown {
   if (typeof val === "string") {
     const t = val.trim().toLowerCase();
@@ -1247,7 +903,6 @@ const searchTool = server.registerTool(
   "search",
   {
     title: "Search Indexed Content",
-    // #846: read-only query over the local FTS5 store. No mutation, no network.
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
@@ -1323,19 +978,18 @@ async function runSearch(params: {
 
     const { limit = 3, source, contentType } = params;
 
-    // Progressive throttling: track calls per agent-context window (#769).
+    // Progressive throttling over a sliding window of calls.
     const now = Date.now();
-    const flood = searchFloodGuard.record("__default__", now);
-    const searchCallCount = flood.count;
+    if (now - searchWindow.start > SEARCH_WINDOW_MS) searchWindow = { start: now, count: 0 };
+    const searchCallCount = ++searchWindow.count;
 
-    // After SEARCH_BLOCK_AFTER calls (for THIS agent): refuse
-    if (flood.blocked) {
+    if (searchCallCount > SEARCH_BLOCK_AFTER) {
       return {
         content: [{
           type: "text" as const,
           text: searchReminder !== undefined
             ? searchReminder || ""
-            : `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - flood.windowStart) / 1000)}s. ` +
+            : `BLOCKED: ${searchCallCount} search calls in ${Math.round((now - searchWindow.start) / 1000)}s. ` +
               "You're flooding context. STOP making individual search calls. " +
               "Use batch_execute(commands, queries) for your next research step.",
         }],
@@ -1344,7 +998,7 @@ async function runSearch(params: {
     }
 
     // Determine per-query result limit based on throttle level
-    const effectiveLimit = flood.softCapped
+    const effectiveLimit = searchCallCount > SEARCH_MAX_RESULTS_AFTER
       ? 1 // after soft cap: only 1 result per query
       : Math.min(limit, 2); // normal: max 2
 
@@ -1373,9 +1027,8 @@ async function runSearch(params: {
 
       const formatted = results
         .map((r, i) => {
-          const origin = (r as any).origin || "current-session";
-          const ts = (r as any).timestamp ? (r as any).timestamp.slice(0, 16).replace("T", " ") : "";
-          const header = `--- [${origin}${ts ? " | " + ts : ""} | ${r.source}] ---`;
+          const ts = r.timestamp ? r.timestamp.slice(0, 16).replace("T", " ") : "";
+          const header = `--- [current-session${ts ? " | " + ts : ""} | ${r.source}] ---`;
           const heading = `### ${r.title}`;
           const snippet = extractSnippet(r.content, q, 1500, r.highlighted);
           return `${header}\n${heading}\n\n${snippet}`;
@@ -1433,6 +1086,13 @@ async function runSearch(params: {
 // ─────────────────────────────────────────────────────────
 // Tool: fetch_and_index
 // ─────────────────────────────────────────────────────────
+
+/** Cut at `maxChars` without splitting a surrogate pair: a lone surrogate is invalid in the JSON reply. */
+function charSafePrefix(str: string, maxChars: number): string {
+  if (str.length <= maxChars) return str;
+  const code = str.charCodeAt(maxChars - 1);
+  return str.slice(0, code >= 0xd800 && code <= 0xdbff ? maxChars - 1 : maxChars);
+}
 
 const FETCH_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const FETCH_PREVIEW_LIMIT = 3072;
@@ -1522,7 +1182,6 @@ server.registerTool(
   "fetch_and_index",
   {
     title: "Fetch & Index URL(s)",
-    // #846: fetches external URLs (open world) and writes them into the store.
     annotations: {
       readOnlyHint: false,
       destructiveHint: false,
@@ -1656,8 +1315,7 @@ server.registerTool(
     }
 
     // Batch response — aggregated summary; isError only when EVERY URL failed.
-    // Per-URL preview capped tightly so a 8-URL batch doesn't undo the
-    // context-savings the tool exists to deliver (PRD review finding G1).
+    // Tight per-URL previews keep an 8-URL batch from undoing the context savings.
     const FETCH_BATCH_PREVIEW_LIMIT = 384; // ~3KB total for 8-URL batches
     const lines: string[] = [];
     let totalSections = 0;
@@ -1722,7 +1380,6 @@ server.registerTool(
   "batch_execute",
   {
     title: "Batch Execute & Search",
-    // #846: runs arbitrary shell commands (with network) and indexes output.
     annotations: {
       readOnlyHint: false,
       destructiveHint: true,
@@ -1794,25 +1451,13 @@ server.registerTool(
     }),
   },
   async ({ commands, queries, timeout, concurrency, cwd, query_scope }) => {
-    // Security: check each command against deny patterns
     for (const cmd of commands) {
-      const denied = checkDenyPolicy(cmd.command);
+      const denied = checkDenyPolicy(cmd.command, "shell");
       if (denied) return denied;
     }
 
     try {
-      // Full stdout is preserved per-command and indexed into FTS5 (Issue #61, #197).
-      // Concurrency>1 switches to a worker pool with per-command timeouts.
-      const effTimeout = timeout;
-      const { outputs: perCommandOutputs, timedOut } = await runBatchCommands(
-        commands,
-        {
-          timeout: effTimeout,
-          concurrency,
-          cwd,
-        },
-        executor,
-      );
+      const { outputs: perCommandOutputs, timedOut } = await runBatchCommands(commands, { timeout, concurrency, cwd }, executor);
 
       const stdout = perCommandOutputs.join("\n");
       const totalBytes = Buffer.byteLength(stdout);
@@ -1823,7 +1468,7 @@ server.registerTool(
           content: [
             {
               type: "text" as const,
-              text: `Batch timed out after ${effTimeout}ms. No output captured.`,
+              text: `Batch timed out after ${timeout}ms. No output captured.`,
             },
           ],
           isError: true,
@@ -1838,10 +1483,7 @@ server.registerTool(
         .slice(0, 80)}`;
       const indexed = store.index({ content: stdout, source });
 
-      // Commands inventory — list what the agent actually ran so the
-      // response itself documents intent, not just per-section echoes.
-      // Placed before "## Indexed Sections" so it scans top-down with
-      // the human asking "what just happened" (Issues #717 + #736).
+      // What ran, listed above the sections it produced.
       const commandsInventory: string[] = ["## Commands", ""];
       for (const c of commands) {
         commandsInventory.push(`- ${c.label}: \`${truncateCommandForEcho(c.command)}\``);
@@ -1864,9 +1506,7 @@ server.registerTool(
       const queryResults = formatBatchQueryResults(store, queries, source, undefined, query_scope);
 
       // Get searchable terms for edge cases where follow-up is needed
-      const distinctiveTerms = store.getDistinctiveTerms
-        ? store.getDistinctiveTerms(indexed.sourceId)
-        : [];
+      const distinctiveTerms = store.getDistinctiveTerms(indexed.sourceId);
 
       const output = [
         `Executed ${commands.length} commands (${totalLines} lines, ${(totalBytes / 1024).toFixed(1)}KB). ` +
@@ -1969,7 +1609,7 @@ server.registerTool(
     const files = filesC.value;
 
     const batchId = randomBytes(3).toString("hex");
-    const labels = deduplicateLabels(files.map((f) => deriveLabel(resolve(getProjectDir(), f))));
+    const labels = deduplicateLabels(files.map((f) => deriveLabel(resolve(process.cwd(), f))));
 
     const store = getStore();
     const skipped: string[] = [];
