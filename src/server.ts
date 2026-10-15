@@ -31,6 +31,7 @@ import { FloodGuard } from "./search/flood-guard.js";
 import {
   findConfig,
   formatPrewarmManifest,
+  type FoundConfig,
   preprocessIndexPathFiles,
   resolveIndexPathFiles,
 } from "./prewarm.js";
@@ -2602,21 +2603,25 @@ server.registerTool(
 // Server startup
 // ─────────────────────────────────────────────────────────
 
-/** Pre-warm the configured sources, then serve MCP over stdio. */
+/** Pre-warm the configured sources, then serve MCP over stdio; a failed pre-warm serves an empty knowledge base. */
 export async function serve(): Promise<void> {
-  const configResult = findConfig(getProjectDir());
-  searchReminder = configResult?.config.searchReminder;
-
-  // Fold the pre-warmed corpus manifest into the search description so the
-  // agent sees what is already searchable without a blind probe.
-  if (configResult) {
-    const start = performance.now();
-    const report = prewarmSession(configResult, getStorePath());
-    if (report.writeBackError) process.stderr.write(`[ctxmode] baseline write-back failed: ${report.writeBackError}\n`);
-    process.stderr.write(`[ctxmode] ${formatReport(report, performance.now() - start)}\n`);
-    const manifest = formatPrewarmManifest(report.sources);
-    if (manifest) searchTool.update({ description: `${TOOL_DESCRIPTIONS.search}\n\n${manifest}` });
+  let found: FoundConfig | null = null;
+  try {
+    found = findConfig(process.cwd());
+    if (found) {
+      const start = performance.now();
+      const report = prewarmSession(found, sessionPath);
+      if (report.writeBackError) process.stderr.write(`[ctxmode] baseline write-back failed: ${report.writeBackError}\n`);
+      process.stderr.write(`[ctxmode] ${formatReport(report, performance.now() - start)}\n`);
+      // The search description lists the pre-warmed corpus so the agent needs no blind probe.
+      const manifest = formatPrewarmManifest(report.sources);
+      if (manifest) searchTool.update({ description: `${TOOL_DESCRIPTIONS.search}\n\n${manifest}` });
+    }
+  } catch (err) {
+    deleteDBFiles(sessionPath);
+    process.stderr.write(`[ctxmode] pre-warm failed, serving an empty knowledge base: ${(err as Error).message}\n`);
   }
+  searchReminder = found?.config.searchReminder;
 
   process.on("exit", () => executor.cleanupBackgrounded());
   process.on("SIGINT", () => process.exit(0));

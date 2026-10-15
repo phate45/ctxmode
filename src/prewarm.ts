@@ -83,9 +83,8 @@ export interface IndexPathOptions {
 
 // ── Config Discovery ────────────────────────────────────────────────
 
-// Env var pointing at an exact config file. When set, the upward walk is
-// skipped and the file is loaded verbatim; an unreadable or invalid file is a
-// hard error rather than a silent fallback, since setting it signals intent.
+// Names an exact config file and skips the upward walk; an unreadable file is
+// an error rather than a fallback to discovery, since setting it signals intent.
 export const CONFIG_ENV_VAR = "CTXMODE_CONFIG";
 
 export interface FoundConfig {

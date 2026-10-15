@@ -1,7 +1,7 @@
 // End-to-end checks the golden transcript does not cover: config discovery,
 // argument coercion, batch_read, searchReminder and the index deny policy.
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -176,4 +176,36 @@ test("index path skips files matching a Read deny rule", async () => {
   } finally {
     await client.close();
   }
+});
+
+test("a failed pre-warm still serves, with an empty knowledge base", async () => {
+  const root = tempRoot();
+  write(join(root, "a.md"), "# A\n\nalpha\n");
+  config(root, { sources: [{ label: "a", path: ".", glob: "*.md" }] });
+  const sessions = join(root, "cache", "ctxmode", "sessions");
+  mkdirSync(sessions, { recursive: true });
+  chmodSync(sessions, 0o555);
+  const client = await connect(root, { XDG_CACHE_HOME: join(root, "cache") });
+  try {
+    const r = await call(client, "execute", { language: "shell", code: "echo still-serving" });
+    expect(r.text).toContain("still-serving");
+  } finally {
+    await client.close();
+    chmodSync(sessions, 0o755);
+  }
+});
+
+test("a malformed config serves an empty knowledge base and fails `prewarm`", async () => {
+  const root = tempRoot();
+  config(root, { sources: { label: "not-an-array" } });
+  const client = await connect(root);
+  try {
+    const r = await call(client, "search", { queries: ["anything"] });
+    expect(r.text).toContain("Knowledge base is empty");
+  } finally {
+    await client.close();
+  }
+  const prewarm = Bun.spawnSync([process.execPath, MAIN, "prewarm"], { cwd: root, env: { ...process.env, CTXMODE_CONFIG: "" } });
+  expect(prewarm.exitCode).toBe(1);
+  expect(prewarm.stderr.toString()).toContain("config.sources: Expected array");
 });
