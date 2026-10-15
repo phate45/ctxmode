@@ -65,22 +65,6 @@ export function parseConfig(raw: string, configPath: string): Config {
   return { ...top.data, sources };
 }
 
-export interface ResolvedFile {
-  /** Display name — relative path from source base, for unique labeling. */
-  name: string;
-  path: string;
-  content: string;
-}
-
-export interface IndexPathOptions {
-  path: string;
-  source?: string;
-  glob?: string;
-  recursive?: boolean;
-  stripFrontmatter?: boolean;
-  prefixDates?: boolean;
-}
-
 // ── Config Discovery ────────────────────────────────────────────────
 
 // Names an exact config file and skips the upward walk; an unreadable file is
@@ -161,17 +145,6 @@ export function walkDir(dir: string, glob: string, recursive: boolean, seen = ne
   return results;
 }
 
-export function readFile(fullPath: string, baseDir?: string): ResolvedFile | null {
-  try {
-    const content = readFileSync(fullPath, "utf-8");
-    if (content.trim().length === 0) return null;
-    const name = baseDir ? relative(baseDir, fullPath) : basename(fullPath);
-    return { name, path: fullPath, content };
-  } catch {
-    return null;
-  }
-}
-
 /**
  * A configured source's files as `name` (relative to the source base) and
  * absolute `path`, or null when its exec command failed and the source's
@@ -244,58 +217,6 @@ export function preprocessText(
   if (opts?.stripFrontmatter) next = stripFrontmatter(next);
   if (opts?.prefixDates) next = prefixDates(next, filename);
   return collapseBlankLines(next);
-}
-
-// ── Wrapper-side Path Indexing ──────────────────────────────────────
-
-export function resolveIndexPathFiles(opts: IndexPathOptions): {
-  basePath: string;
-  isDirectory: boolean;
-  files: ResolvedFile[];
-  sourcePrefix: string;
-} {
-  const basePath = resolve(opts.path);
-  const stat = statSync(basePath);
-  const sourcePrefix = String(opts.source ?? basename(basePath));
-
-  if (stat.isDirectory()) {
-    const glob = opts.glob ?? "*.md";
-    const recursive = opts.recursive !== false;
-    const files = walkDir(basePath, glob, recursive)
-      .map((p) => readFile(p, basePath))
-      .filter((f): f is ResolvedFile => f !== null);
-    return { basePath, isDirectory: true, files, sourcePrefix };
-  }
-
-  const file = readFile(basePath);
-  return {
-    basePath,
-    isDirectory: false,
-    files: file ? [file] : [],
-    sourcePrefix,
-  };
-}
-
-export function preprocessIndexPathFiles(
-  files: ResolvedFile[],
-  opts?: { stripFrontmatter?: boolean; prefixDates?: boolean },
-): Array<{ source: string; content: string; file: ResolvedFile }> {
-  const strip = opts?.stripFrontmatter !== false;
-  const prefix = opts?.prefixDates === true;
-
-  return files
-    .map((file) => ({
-      file,
-      content: preprocessText(file.content, file.name, {
-        stripFrontmatter: strip,
-        prefixDates: prefix,
-      }),
-    }))
-    .filter((entry) => entry.content.trim().length > 0)
-    .map((entry) => ({
-      ...entry,
-      source: entry.file.name,
-    }));
 }
 
 // ── Pre-Warm ────────────────────────────────────────────────────────

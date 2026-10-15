@@ -3,8 +3,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import TurndownService from "turndown";
 import { gfm } from "turndown-plugin-gfm";
-import { readFileSync, writeSync, rmSync, statSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { closeSync, constants, fstatSync, openSync, readFileSync, writeSync, rmSync, statSync } from "node:fs";
+import { basename, join, relative, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 import { tmpdir, cpus } from "node:os";
 import { z } from "zod";
@@ -19,7 +19,6 @@ import {
   readBashPolicies,
   evaluateCommandDenyOnly,
   extractShellCommands,
-  readToolDenyPatterns,
   readToolPermissionPatterns,
   evaluateFilePath,
   evaluateProjectContainment,
@@ -28,13 +27,7 @@ import { detectRuntimes, type Language } from "./runtime.js";
 import { classifyNonZeroExit } from "./exit-classify.js";
 import { charSafePrefix } from "./truncate.js";
 import { FloodGuard } from "./search/flood-guard.js";
-import {
-  findConfig,
-  formatPrewarmManifest,
-  type FoundConfig,
-  preprocessIndexPathFiles,
-  resolveIndexPathFiles,
-} from "./prewarm.js";
+import { findConfig, formatPrewarmManifest, preprocessText, walkDir, type FoundConfig } from "./prewarm.js";
 
 const TOOL_DESCRIPTIONS = {
   execute:
@@ -177,81 +170,33 @@ function checkNonShellDenyPolicy(
 }
 
 /**
- * Issue #852 — project-boundary containment for `execute`.
- *
- * The harness sandbox (Claude Code, etc.) cannot inspect MCP input params, so a
- * user approving a `execute` call cannot see that its `path` escapes
- * the workspace. This guard refuses a `path` that resolves outside the project
- * root (absolute escape, `../` traversal, or symlink-out), restoring the
- * boundary the host believes it is enforcing.
- *
- * Escape hatch — NO bespoke opt-out env. A deliberate out-of-project read is
- * expressed in the SAME host config the user already maintains: a
- * `permissions.allow` rule like `Read(/var/log/**)`. This reuses the exact
- * mechanism Claude Code uses to whitelist a path outside its sandbox, so the
- * grant lives in one place and stays meaningful instead of rotting into a
- * context-mode-only env flag nobody sets.
- *
- * Fail-open on resolver failure (consistent with the other deny checks): if the
- * project root cannot be resolved, containment evaluates as "inside" and the
- * path is allowed through rather than spuriously blocking legitimate work.
+ * The one gate for every file a tool reads by path. Read deny rules apply to
+ * all of them; `execute` (whose child process reads the file) must also stay
+ * inside the project root unless a Read allow rule names the path. The file is
+ * opened non-blocking and checked with fstat, so a FIFO or device cannot hang
+ * the server and /dev/stdin cannot read the JSON-RPC stream. Returns the file's
+ * text (empty for `execute`), or why it may not be used.
  */
-function checkProjectBoundary(
-  filePath: string,
-  toolName: string,
-): ToolResult | null {
+function guardPath(path: string, forExecute = false): { path: string; text: string } | { path: string; error: string } {
+  const dir = process.cwd();
+  const abs = resolve(dir, path);
   try {
-    const projectDir = getProjectDir();
-    const allowGlobs = readToolPermissionPatterns("Read", "allow", projectDir);
-    const verdict = evaluateProjectContainment(filePath, projectDir, allowGlobs);
-    if (verdict.allowed) return null;
-    return {
-      content: [{
-        type: "text" as const,
-        text:
-          `File access blocked: "${filePath}" resolves outside the project root ` +
-          `(${projectDir}). context-mode confines ${toolName} to the workspace so it ` +
-          `cannot be used to bypass the host's sandbox/permission controls (issue #852). ` +
-          `To intentionally process a file outside the project, add a host allow rule, ` +
-          `e.g. "permissions": { "allow": ["Read(${filePath})"] } in your settings.`,
-      }],
-      isError: true,
-    };
-  } catch {
-    // Fail-open — resolver failure must not block legitimate in-project work.
-  }
-  return null;
-}
-
-/**
- * Check a file path against Read deny patterns.
- * Returns an error ToolResult if denied, or null if allowed.
- */
-function checkFilePathDenyPolicy(
-  filePath: string,
-): ToolResult | null {
-  try {
-    const projectDir = getProjectDir();
-    const denyGlobs = readToolDenyPatterns("Read", projectDir);
-    const result = evaluateFilePath(
-      filePath,
-      denyGlobs,
-      process.platform === "win32",
-      projectDir,
-    );
-    if (result.denied) {
-      return {
-        content: [{
-          type: "text" as const,
-          text: `File access blocked by security policy: path matches Read deny pattern ${result.matchedPattern}`,
-        }],
-        isError: true,
-      };
+    if (forExecute && !evaluateProjectContainment(path, dir, readToolPermissionPatterns("Read", "allow", dir)).allowed) {
+      return { path: abs, error: `resolves outside the project root (${dir}); to allow it, add "Read(${abs})" to permissions.allow in your Claude Code settings` };
     }
-  } catch {
-    // Fail-open
+    const deny = evaluateFilePath(path, readToolPermissionPatterns("Read", "deny", dir), false, dir);
+    if (deny.denied) return { path: abs, error: `blocked by Read deny policy ${deny.matchedPattern}` };
+  } catch { /* fail-open: an unreadable settings file must not block in-project work */ }
+  let fd: number | undefined;
+  try {
+    fd = openSync(abs, constants.O_RDONLY | constants.O_NONBLOCK);
+    if (!fstatSync(fd).isFile()) return { path: abs, error: "not a regular file" };
+    return { path: abs, text: forExecute ? "" : readFileSync(fd, "utf-8") };
+  } catch (err) {
+    return { path: abs, error: (err as Error).message };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
-  return null;
 }
 
 
@@ -954,15 +899,10 @@ async function executeFile({ path, language, code, timeout, intent }: {
   timeout?: number;
   intent?: string;
 }): Promise<ToolResult> {
-  // Security (#852): confine the processed file to the project root so
-  // execute cannot be used to escape the host's sandbox/permission
-  // controls. Runs before the deny-glob check — boundary first, then policy.
-  const boundaryDenied = checkProjectBoundary(path, "execute");
-  if (boundaryDenied) return boundaryDenied;
-
-  // Security: check file path against Read deny patterns
-  const pathDenied = checkFilePathDenyPolicy(path);
-  if (pathDenied) return pathDenied;
+  const guarded = guardPath(path, true);
+  if ("error" in guarded) {
+    return { content: [{ type: "text" as const, text: `File access blocked: "${path}" ${guarded.error}` }], isError: true };
+  }
 
   // Security: check code parameter against Bash deny patterns
   if (language === "shell") {
@@ -1158,8 +1098,7 @@ server.registerTool(
 
 /**
  * Index a file, or every glob-matched file under a directory, each as its own
- * source after markdown preprocessing. Relative paths resolve against the
- * project dir; files matching a Read deny rule are skipped and reported.
+ * source after markdown preprocessing. Files guardPath refuses are reported.
  */
 function indexPath(args: {
   path: string;
@@ -1169,52 +1108,44 @@ function indexPath(args: {
   stripFrontmatter?: boolean;
   prefixDates?: boolean;
 }): ToolResult {
-  let resolved;
+  const basePath = resolve(process.cwd(), args.path);
+  let isDirectory: boolean;
   try {
-    resolved = resolveIndexPathFiles({ ...args, path: resolve(getProjectDir(), args.path) });
+    isDirectory = statSync(basePath).isDirectory();
   } catch (err: any) {
-    return {
-      content: [{ type: "text" as const, text: `Index error: ${err.message}` }],
-      isError: true,
-    };
+    return { content: [{ type: "text" as const, text: `Index error: ${err.message}` }], isError: true };
   }
+  const paths = isDirectory ? walkDir(basePath, args.glob ?? "*.md", args.recursive !== false) : [args.path];
+  if (paths.length === 0) return { content: [{ type: "text" as const, text: `No files matched in ${basePath}.` }] };
 
-  if (resolved.files.length === 0) {
-    return {
-      content: [{
-        type: "text" as const,
-        text: resolved.isDirectory
-          ? `No files matched in ${resolved.basePath}.`
-          : `Nothing indexable found at ${resolved.basePath}.`,
-      }],
-    };
-  }
-
-  const prepared = preprocessIndexPathFiles(resolved.files, args);
   const store = getStore();
+  const prefix = args.source ?? basename(basePath);
+  const opts = { stripFrontmatter: args.stripFrontmatter !== false, prefixDates: args.prefixDates === true };
   let indexed = 0;
   let totalChunks = 0;
   const errors: string[] = [];
-
-  for (const entry of prepared) {
-    if (checkFilePathDenyPolicy(entry.file.path)) {
-      errors.push(`${entry.file.name}: blocked by Read deny policy`);
+  for (const path of paths) {
+    const name = isDirectory ? relative(basePath, path) : basename(path);
+    const file = guardPath(path);
+    if ("error" in file) {
+      errors.push(`${name}: ${file.error}`);
       continue;
     }
-    const source = resolved.isDirectory
-      ? `${resolved.sourcePrefix}: ${entry.source}`
-      : args.source ?? resolved.basePath;
+    const content = preprocessText(file.text, name, opts);
+    if (content.trim().length === 0) continue;
     try {
-      totalChunks += store.index({ content: entry.content, source }).totalChunks;
+      totalChunks += store.index({ content, source: isDirectory ? `${prefix}: ${name}` : args.source ?? basePath }).totalChunks;
       indexed++;
     } catch (err: any) {
-      errors.push(`${entry.file.name}: ${err.message}`);
+      errors.push(`${name}: ${err.message}`);
     }
   }
 
-  const summary = resolved.isDirectory
-    ? `Indexed ${indexed} file${indexed === 1 ? "" : "s"} (${totalChunks} chunks) from ${resolved.basePath}`
-    : `Indexed ${totalChunks} sections from: ${args.source ?? resolved.basePath}`;
+  const summary = !isDirectory && indexed === 0 && errors.length === 0
+    ? `Nothing indexable found at ${basePath}.`
+    : isDirectory
+      ? `Indexed ${indexed} file${indexed === 1 ? "" : "s"} (${totalChunks} chunks) from ${basePath}`
+      : `Indexed ${totalChunks} sections from: ${args.source ?? basePath}`;
 
   return {
     content: [{
@@ -2570,15 +2501,9 @@ server.registerTool(
     const store = getStore();
     const skipped: string[] = [];
     for (let i = 0; i < files.length; i++) {
-      const filePath = resolve(getProjectDir(), files[i]);
-      let content: string;
-      try {
-        content = readFileSync(filePath, "utf-8");
-      } catch {
-        skipped.push(filePath);
-        continue;
-      }
-      store.index({ content, source: `${batchId}/${labels[i]}` });
+      const file = guardPath(files[i]);
+      if ("error" in file) skipped.push(`${file.path}: ${file.error}`);
+      else store.index({ content: file.text, source: `${batchId}/${labels[i]}` });
     }
 
     const searchResult = await runSearch({ queries: queriesC.value, source: batchId, limit: 3 });
@@ -2586,7 +2511,7 @@ server.registerTool(
 
     const errorNote =
       skipped.length > 0
-        ? `\n\n⚠ Could not read ${skipped.length} file(s):\n${skipped.map((f) => `  - ${f}`).join("\n")}`
+        ? `\n\n⚠ Skipped ${skipped.length} file(s):\n${skipped.map((f) => `  - ${f}`).join("\n")}`
         : "";
 
     const followUpNote =

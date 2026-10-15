@@ -209,3 +209,41 @@ test("a malformed config serves an empty knowledge base and fails `prewarm`", as
   expect(prewarm.exitCode).toBe(1);
   expect(prewarm.stderr.toString()).toContain("config.sources: Expected array");
 });
+
+test("path-reading tools share one guard: deny rules, regular files only, execute stays in the project", async () => {
+  const root = tempRoot();
+  const outside = tempRoot();
+  write(join(root, "ok.md"), "# Ok\n\nguard-ok-token\n");
+  write(join(root, "secret.md"), "# Secret\n\nguard-secret-token\n");
+  write(join(outside, "far.txt"), "far away\n");
+  write(join(outside, "allowed.txt"), "allowed-outside\n");
+  Bun.spawnSync(["mkfifo", join(root, "pipe.md")]);
+  write(join(root, ".claude", "settings.json"), JSON.stringify({
+    permissions: { deny: ["Read(**/secret.md)"], allow: [`Read(${join(outside, "allowed.txt")})`] },
+  }));
+  const client = await connect(root);
+  try {
+    const read = await call(client, "batch_read", { files: ["ok.md", "secret.md", "pipe.md", "/dev/stdin"], queries: ["guard-ok-token"] });
+    expect(read.text).toContain("guard-ok-token");
+    expect(read.text).toContain("secret.md: blocked by Read deny policy **/secret.md");
+    expect(read.text).toContain("pipe.md: not a regular file");
+    expect(read.text).toMatch(/\/dev\/stdin: (not a regular file|ENXIO)/);
+    expect(read.text).not.toContain("guard-secret-token");
+
+    const fifo = await call(client, "index", { path: "pipe.md" });
+    expect(fifo.isError).toBe(true);
+    expect(fifo.text).toContain("pipe.md: not a regular file");
+
+    const code = "cat \"$FILE_CONTENT_PATH\"";
+    const far = await call(client, "execute", { language: "shell", code, path: join(outside, "far.txt") });
+    expect(far.isError).toBe(true);
+    expect(far.text).toContain("resolves outside the project root");
+    const allowed = await call(client, "execute", { language: "shell", code, path: join(outside, "allowed.txt") });
+    expect(allowed.text).toContain("allowed-outside");
+    const denied = await call(client, "execute", { language: "shell", code, path: "secret.md" });
+    expect(denied.isError).toBe(true);
+    expect(denied.text).toContain("blocked by Read deny policy");
+  } finally {
+    await client.close();
+  }
+}, 20_000);
