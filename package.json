@@ -28,5 +28,6 @@
   "trustedDependencies": [
     "better-sqlite3",
     "esbuild"
-  ]
+  ],
+  "license": "Elastic-2.0"
 }
