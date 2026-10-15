@@ -5,43 +5,64 @@
  * markdown-specific preprocessing; cache.ts indexes them.
  */
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { execSync } from "node:child_process";
 import { join, dirname, basename, resolve, relative } from "node:path";
+import { z } from "zod";
 
 /** Version of source resolution and preprocessing; a change invalidates baselines. */
 export const PREPROCESS_VERSION = 1;
 
-// ── Types ────────────────────────────────────────────────────────────
+// ── Config ──────────────────────────────────────────────────────────
 
-export interface SourceConfig {
-  label: string;
-  /** Author annotation describing what this source is. Folded into the search manifest. */
-  description?: string;
-  path?: string;
-  glob?: string;
-  recursive?: boolean;
-  exec?: string;
-  paths?: string[];
-  stripFrontmatter?: boolean;
-  prefixDates?: boolean;
-}
+const Source = z
+  .object({
+    label: z.string().min(1),
+    /** Author annotation describing what this source is. Folded into the search manifest. */
+    description: z.string().optional(),
+    path: z.string().optional(),
+    glob: z.string().optional(),
+    recursive: z.boolean().optional(),
+    exec: z.string().optional(),
+    paths: z.array(z.string()).optional(),
+    stripFrontmatter: z.boolean().optional(),
+    prefixDates: z.boolean().optional(),
+  })
+  .refine((s) => s.paths || s.exec || (s.glob && s.path), "needs `paths`, `exec`, or `glob` + `path`");
 
-export interface SubagentProfile {
-  /** Skip injection entirely — agent gets no routing block. */
-  skip?: boolean;
-  /** Use CORE_BLOCK + named ending. */
-  ending?: "plan" | "concise";
-  /** Full custom injection text, replaces entire routing block. */
-  block?: string;
-}
+const ConfigFile = z
+  .object({
+    sources: z.array(z.unknown()).default([]),
+    /** Per-agent-type routing overrides for the subagent hook: skip it, pick an ending, or replace the block. */
+    subagentProfiles: z
+      .record(z.object({ skip: z.boolean().optional(), ending: z.enum(["plan", "concise"]).optional(), block: z.string().optional() }))
+      .optional(),
+    /** Control search budget warnings: false strips them, a string replaces them. */
+    searchReminder: z.union([z.literal(false), z.string()]).optional(),
+  });
 
-export interface Config {
-  sources: SourceConfig[];
-  /** Per-agent-type routing overrides for the subagent hook. */
-  subagentProfiles?: Record<string, SubagentProfile>;
-  /** Control search budget warnings: false strips them, a string replaces them. */
-  searchReminder?: false | string;
+export type SourceConfig = z.infer<typeof Source>;
+export type Config = Omit<z.infer<typeof ConfigFile>, "sources"> & { sources: SourceConfig[] };
+
+const issues = (e: z.ZodError, what: string) => e.issues.map((i) => `${[what, ...i.path].join(".")}: ${i.message}`).join("; ");
+
+/** Parse a config file; a malformed top level throws, a malformed source is skipped with a warning. */
+export function parseConfig(raw: string, configPath: string): Config {
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch (err) {
+    throw new Error(`config "${configPath}" is not valid JSON: ${(err as Error).message}`);
+  }
+  const top = ConfigFile.safeParse(json);
+  if (!top.success) throw new Error(`config "${configPath}" is invalid: ${issues(top.error, "config")}`);
+  const sources: SourceConfig[] = [];
+  top.data.sources.forEach((entry, i) => {
+    const source = Source.safeParse(entry);
+    if (source.success) sources.push(source.data);
+    else process.stderr.write(`[ctxmode] skipping a source in "${configPath}": ${issues(source.error, `sources[${i}]`)}\n`);
+  });
+  return { ...top.data, sources };
 }
 
 export interface ResolvedFile {
@@ -91,30 +112,18 @@ export function findConfig(startDir: string): FoundConfig | null {
         `${CONFIG_ENV_VAR} points at "${configPath}" but it could not be read: ${(err as Error).message}`,
       );
     }
-    try {
-      return { config: JSON.parse(raw), configPath, sourceBase: resolve(startDir) };
-    } catch (err) {
-      throw new Error(
-        `${CONFIG_ENV_VAR} config at "${configPath}" is not valid JSON: ${(err as Error).message}`,
-      );
-    }
+    return { config: parseConfig(raw, configPath), configPath, sourceBase: resolve(startDir) };
   }
 
-  let dir = resolve(startDir);
-
-  while (true) {
-    const candidate = join(dir, ".claude", "ctxmode.json");
+  for (let dir = resolve(startDir); ; dir = dirname(dir)) {
+    const configPath = join(dir, ".claude", "ctxmode.json");
+    let raw: string | undefined;
     try {
-      const raw = readFileSync(candidate, "utf-8");
-      return { config: JSON.parse(raw), configPath: candidate, sourceBase: dir };
-    } catch {
-      // not found here, keep walking
-    }
-    const parent = dirname(dir);
-    if (parent === dir) break; // filesystem root
-    dir = parent;
+      raw = readFileSync(configPath, "utf-8");
+    } catch { /* not found here, keep walking */ }
+    if (raw !== undefined) return { config: parseConfig(raw, configPath), configPath, sourceBase: dir };
+    if (dirname(dir) === dir) return null;
   }
-  return null;
 }
 
 // ── File Resolution ─────────────────────────────────────────────────
@@ -127,16 +136,19 @@ export function matchGlob(filename: string, pattern: string): boolean {
   return new RegExp(`^${escaped}$`).test(filename);
 }
 
-export function walkDir(dir: string, glob: string, recursive: boolean): string[] {
+export function walkDir(dir: string, glob: string, recursive: boolean, seen = new Set<string>()): string[] {
   const results: string[] = [];
   try {
-    const entries = readdirSync(dir);
-    for (const entry of entries) {
+    // A symlink back up the tree would otherwise be walked, and its files indexed, once per lap.
+    const real = realpathSync(dir);
+    if (seen.has(real)) return results;
+    seen.add(real);
+    for (const entry of readdirSync(dir)) {
       const fullPath = join(dir, entry);
       try {
         const stat = statSync(fullPath);
         if (stat.isDirectory() && recursive) {
-          results.push(...walkDir(fullPath, glob, true));
+          results.push(...walkDir(fullPath, glob, true, seen));
         } else if (stat.isFile() && matchGlob(entry, glob)) {
           results.push(fullPath);
         }
@@ -161,52 +173,33 @@ export function readFile(fullPath: string, baseDir?: string): ResolvedFile | nul
   }
 }
 
-/** A configured source's files as `name` (relative to the source base) and absolute `path`. */
+/**
+ * A configured source's files as `name` (relative to the source base) and
+ * absolute `path`, or null when its exec command failed and the source's
+ * previous files should be kept.
+ */
 export function resolveSourcePaths(
   source: SourceConfig,
   sourceBase: string,
-): Array<{ name: string; path: string }> {
+): Array<{ name: string; path: string }> | null {
   const basePath = resolve(sourceBase, source.path || ".");
-  const named = (paths: string[], base: string) =>
-    paths.map((p) => resolve(base, p)).map((p) => ({ name: relative(base, p), path: p }));
+  const named = (paths: string[]) =>
+    paths.map((p) => resolve(basePath, p)).map((p) => ({ name: relative(basePath, p), path: p }));
 
-  // Strategy 1: explicit paths
-  if (source.paths) return named(source.paths, basePath);
+  if (source.paths) return named(source.paths);
 
-  // Strategy 2: exec command → JSON array of paths
   if (source.exec) {
-    const cwd = basePath;
     try {
-      const output = execSync(source.exec, {
-        cwd,
-        encoding: "utf-8",
-        timeout: 10000,
-      }).trim();
-      const paths = JSON.parse(output);
-      if (!Array.isArray(paths)) {
-        process.stderr.write(
-          `[ctxmode] exec for "${source.label}" did not return an array\n`,
-        );
-        return [];
-      }
-      return named(paths, cwd);
-    } catch (err: any) {
-      process.stderr.write(
-        `[ctxmode] exec for "${source.label}" failed: ${err.message}\n`,
-      );
-      return [];
+      const paths = JSON.parse(execSync(source.exec, { cwd: basePath, encoding: "utf-8", timeout: 10000 }));
+      if (Array.isArray(paths) && paths.every((p) => typeof p === "string")) return named(paths);
+      process.stderr.write(`[ctxmode] exec for "${source.label}" did not print a JSON array of paths; keeping its previous files\n`);
+    } catch (err) {
+      process.stderr.write(`[ctxmode] exec for "${source.label}" failed; keeping its previous files: ${(err as Error).message}\n`);
     }
+    return null;
   }
 
-  // Strategy 3: glob (flat or recursive)
-  if (source.glob && source.path) {
-    return named(walkDir(basePath, source.glob, !!source.recursive), basePath);
-  }
-
-  process.stderr.write(
-    `[ctxmode] source "${source.label}" has no file selection strategy (need glob+path, exec, or paths)\n`,
-  );
-  return [];
+  return named(walkDir(basePath, source.glob!, !!source.recursive));
 }
 
 // ── Preprocessing ───────────────────────────────────────────────────

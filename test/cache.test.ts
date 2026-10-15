@@ -1,11 +1,11 @@
 // Baseline cache: per-file diff, cold-miss rules, manifest stability, session sweep, concurrent write-back.
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { baselinePath, prewarmSession, sweepDead } from "../src/cache.ts";
-import { formatPrewarmManifest, type Config, type FoundConfig } from "../src/prewarm.ts";
+import { formatPrewarmManifest, parseConfig, type Config, type FoundConfig } from "../src/prewarm.ts";
 import { ContentStore } from "../src/store.ts";
 
 const MAIN = join(import.meta.dir, "..", "src", "main.ts");
@@ -153,4 +153,44 @@ test("two concurrent write-backs leave a valid baseline", async () => {
   const r = run(found);
   expect(counts(r)).toEqual({ warm: true, clean: 200, changed: 0, added: 0, removed: 0, refreshed: 0 });
   r.close();
+});
+
+test("a failing exec source keeps its previous files", () => {
+  const found = project({ "a.md": "# A\n\nalpha\n", "b.md": "# B\n\nbravo\n" });
+  const flag = join(found.sourceBase, "exec-ok");
+  writeFileSync(flag, "");
+  found.config = { sources: [{ label: "ex", path: "notes", exec: `test -e ${flag} && printf '["a.md","b.md"]'` }] };
+  run(found).close();
+  unlinkSync(flag);
+  const r = run(found);
+  expect(counts(r)).toEqual({ warm: true, clean: 0, changed: 0, added: 0, removed: 0, refreshed: 0 });
+  expect(r.report.files).toBe(2);
+  expect(r.hits("bravo")).toEqual(["ex: b.md"]);
+  r.close();
+});
+
+test("a recursive glob indexes each file once despite a symlink loop", () => {
+  const found = project({ "a.md": "# A\n\nalpha\n" }, { sources: [{ label: "w", path: "notes", glob: "*.md", recursive: true }] });
+  symlinkSync("..", join(found.sourceBase, "notes", "loop"));
+  const r = run(found);
+  expect(r.report.files).toBe(1);
+  expect(r.hits("alpha")).toEqual(["w: a.md"]);
+  r.close();
+});
+
+describe("config parsing", () => {
+  test("sources default to empty and bad entries are skipped", () => {
+    expect(parseConfig(`{"subagentProfiles":{"Plan":{"skip":true}}}`, "c.json").sources).toEqual([]);
+    const sources = parseConfig(
+      JSON.stringify({ sources: [{ label: "ok", paths: ["a.md"] }, { label: "no-strategy" }, { paths: ["b.md"] }, "junk"] }),
+      "c.json",
+    ).sources;
+    expect(sources.map((s) => s.label)).toEqual(["ok"]);
+  });
+
+  test("a malformed top level is an error", () => {
+    for (const raw of [`[]`, `{"sources":{}}`, `{"searchReminder":true}`, `{"sources":[`]) {
+      expect(() => parseConfig(raw, "c.json")).toThrow(/c\.json/);
+    }
+  });
 });

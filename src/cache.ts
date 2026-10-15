@@ -139,8 +139,11 @@ export function prewarmSession(found: FoundConfig, sessionPath: string): Prewarm
 
   // Later entries win a label clash, matching the store's per-label dedupe.
   const current = new Map<string, { source: SourceConfig; name: string; path: string; mtimeNs: string; size: number }>();
+  const unresolved = new Set<string>();
   for (const source of config.sources) {
-    for (const { name, path } of resolveSourcePaths(source, sourceBase)) {
+    const paths = resolveSourcePaths(source, sourceBase);
+    if (!paths) unresolved.add(source.label);
+    for (const { name, path } of paths ?? []) {
       try {
         const st = statSync(path, { bigint: true });
         if (!st.isFile()) continue;
@@ -182,7 +185,9 @@ export function prewarmSession(found: FoundConfig, sessionPath: string): Prewarm
     else added++;
     work.push({ label, text: preprocessText(buf.toString("utf-8"), f.name, f.source) });
   }
-  const removed = [...(manifest?.keys() ?? [])].filter((label) => !current.has(label));
+  const removed = [...(manifest?.values() ?? [])]
+    .filter((row) => !current.has(row.label) && !unresolved.has(row.source))
+    .map((row) => row.label);
   lap("diff");
 
   if (!warm || work.length > 0 || removed.length > 0) {
