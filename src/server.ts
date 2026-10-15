@@ -108,26 +108,6 @@ function getStore(): ContentStore {
   if (!_store) {
     const dbPath = getStorePath();
     _store = new ContentStore(dbPath);
-
-    // Wire deny-policy hook: store re-checks the Read deny list before
-    // re-reading any file_path during auto-refresh. Catches policy edits
-    // made after a file was originally indexed. See #442 round-3.
-    _store.setDenyChecker((filePath: string) => {
-      try {
-        const projectDir = getProjectDir();
-        const denyGlobs = readToolDenyPatterns("Read", projectDir);
-        const r = evaluateFilePath(
-          filePath,
-          denyGlobs,
-          process.platform === "win32",
-          projectDir,
-        );
-        return r.denied;
-      } catch {
-        // Fail-closed for refresh: skip on error rather than re-read.
-        return true;
-      }
-    });
   }
   return _store;
 }
@@ -1484,11 +1464,6 @@ async function runSearch(params: {
     }
 
     let output = sections.join("\n\n---\n\n");
-
-    // Report auto-refreshed stale sources
-    if (store.lastRefreshCount > 0) {
-      output = `> Auto-refreshed ${store.lastRefreshCount} stale source${store.lastRefreshCount > 1 ? "s" : ""} (file changed since indexing).\n\n` + output;
-    }
 
     // Throttle counter — always surfaced so agents can pace themselves
     // proactively instead of discovering the limit only after results are

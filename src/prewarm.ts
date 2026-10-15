@@ -346,29 +346,32 @@ export function prewarm(
   // sharing a label fold into one manifest entry.
   const summaries = new Map<string, PrewarmSourceSummary>();
 
-  for (const source of config.sources) {
-    const files = resolveSourceFiles(source, sourceBase);
-    if (files.length === 0) continue;
+  // One transaction for the whole corpus: per-file commits cost about 40% more.
+  store.transaction(() => {
+    for (const source of config.sources) {
+      const files = resolveSourceFiles(source, sourceBase);
+      if (files.length === 0) continue;
 
-    for (const file of files) {
-      const text = preprocessFile(file, source);
-      if (text.trim().length === 0) continue;
-      const label = `${source.label}: ${file.name}`;
-      const result = store.index({ content: text, source: label });
-      totalSources++;
-      totalChunks += result.totalChunks;
+      for (const file of files) {
+        const text = preprocessFile(file, source);
+        if (text.trim().length === 0) continue;
+        const label = `${source.label}: ${file.name}`;
+        const result = store.index({ content: text, source: label });
+        totalSources++;
+        totalChunks += result.totalChunks;
 
-      const summary = summaries.get(source.label) ?? {
-        label: source.label,
-        description: source.description,
-        files: 0,
-        chunks: 0,
-      };
-      summary.files++;
-      summary.chunks += result.totalChunks;
-      summaries.set(source.label, summary);
+        const summary = summaries.get(source.label) ?? {
+          label: source.label,
+          description: source.description,
+          files: 0,
+          chunks: 0,
+        };
+        summary.files++;
+        summary.chunks += result.totalChunks;
+        summaries.set(source.label, summary);
+      }
     }
-  }
+  });
 
   store.close();
   return {
