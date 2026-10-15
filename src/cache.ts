@@ -1,8 +1,8 @@
 /**
  * Baseline + session DB lifecycle.
  *
- * `<repo>/.ctxmode/baseline.db` holds the last prewarmed index plus a manifest
- * of the files it was built from. Startup copies it to a per-process session
+ * `<repo>/.ctxmode/<config id>.db` holds the last prewarmed index plus a
+ * manifest of the files it was built from. Startup copies it to a per-process session
  * DB, re-indexes only the files whose content changed, and writes the result
  * back with one atomic rename, so concurrent sessions need no lock.
  */
@@ -12,7 +12,7 @@ import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { deleteDBFiles } from "./db-base.ts";
 import { ContentStore, STORE_VERSION } from "./store.ts";
 import {
@@ -26,7 +26,7 @@ import {
 } from "./prewarm.ts";
 
 const MANIFEST_SCHEMA = `
-  CREATE TABLE IF NOT EXISTS cache_meta (key TEXT NOT NULL);
+  CREATE TABLE IF NOT EXISTS cache_meta (key TEXT NOT NULL, scanned_ns TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS cache_files (
     label TEXT PRIMARY KEY,
     source TEXT NOT NULL,
@@ -100,24 +100,33 @@ export function sweepDead(dir: string, re: RegExp): number {
   return swept;
 }
 
-/** `<repo>/.ctxmode/baseline.db`; worktrees share their main checkout's. Otherwise `<sourceBase>/.ctxmode/`. */
-export function baselinePath(sourceBase: string): string {
+/**
+ * `<repo>/.ctxmode/<id>.db`, one baseline per config. `<repo>` is the main
+ * checkout, else `sourceBase`; `<id>` hashes the config's path within its
+ * checkout, so worktrees share a baseline, or its absolute path when outside.
+ */
+export function baselinePath({ configPath, sourceBase }: FoundConfig): string {
   let root = sourceBase;
+  let checkout = sourceBase;
   try {
-    const common = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+    const [top, common] = execFileSync("git", ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"], {
       cwd: sourceBase,
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
-    }).trim();
+    }).trim().split("\n");
+    checkout = top;
     // A submodule's common dir lives inside the superproject's .git/modules.
     if (basename(common) === ".git") root = dirname(common);
   } catch { /* not a git checkout */ }
-  return join(root, ".ctxmode", "baseline.db");
+  const rel = relative(checkout, configPath);
+  const id = rel.startsWith("..") || isAbsolute(rel) ? configPath : rel;
+  return join(root, ".ctxmode", `${createHash("sha256").update(id).digest("hex").slice(0, 12)}.db`);
 }
 
+/** Descriptions are left out: they only reach the search manifest, which reads the live config. */
 export function cacheKey(config: Config): string {
-  const sources = createHash("sha256").update(JSON.stringify(config.sources)).digest("hex");
-  return `${STORE_VERSION}.${PREPROCESS_VERSION}.${sources}`;
+  const sources = config.sources.map(({ description, ...rest }) => rest);
+  return `${STORE_VERSION}.${PREPROCESS_VERSION}.${createHash("sha256").update(JSON.stringify(sources)).digest("hex")}`;
 }
 
 // ── Prewarm ─────────────────────────────────────────────────────────
@@ -129,6 +138,7 @@ export function cacheKey(config: Config): string {
  */
 export function prewarmSession(found: FoundConfig, sessionPath: string): PrewarmReport {
   const { config, sourceBase } = found;
+  const scannedNs = BigInt(Date.now()) * 1_000_000n;
   const timings: Record<string, number> = {};
   let mark = performance.now();
   const lap = (phase: string) => {
@@ -153,10 +163,13 @@ export function prewarmSession(found: FoundConfig, sessionPath: string): Prewarm
   }
   lap("resolve");
 
-  const baseline = baselinePath(sourceBase);
+  const baseline = baselinePath(found);
   const key = cacheKey(config);
-  const manifest = restoreBaseline(baseline, key, sessionPath);
-  const warm = manifest !== null;
+  const restored = restoreBaseline(baseline, key, sessionPath);
+  const manifest = restored?.rows;
+  const warm = restored !== null;
+  // A file written within a timestamp tick of the last scan can change without changing its stat.
+  const racyFrom = (restored?.scannedNs ?? 0n) - 1_000_000_000n;
   lap("restore");
 
   const upserts: ManifestRow[] = [];
@@ -164,7 +177,8 @@ export function prewarmSession(found: FoundConfig, sessionPath: string): Prewarm
   let clean = 0, changed = 0, added = 0, refreshed = 0;
   for (const [label, f] of current) {
     const old = manifest?.get(label);
-    if (old && old.path === f.path && old.mtime_ns === f.mtimeNs && old.size === f.size) {
+    const sameStat = old && old.path === f.path && old.mtime_ns === f.mtimeNs && old.size === f.size;
+    if (sameStat && BigInt(f.mtimeNs) < racyFrom) {
       clean++;
       continue;
     }
@@ -176,11 +190,15 @@ export function prewarmSession(found: FoundConfig, sessionPath: string): Prewarm
       continue;
     }
     const row = { label, source: f.source.label, path: f.path, mtime_ns: f.mtimeNs, size: f.size, sha256: createHash("sha256").update(buf).digest("hex") };
-    upserts.push(row);
-    if (old && old.sha256 === row.sha256) {
-      refreshed++;
+    if (old?.sha256 === row.sha256) {
+      if (sameStat) clean++;
+      else {
+        refreshed++;
+        upserts.push(row);
+      }
       continue;
     }
+    upserts.push(row);
     if (old) changed++;
     else added++;
     work.push({ label, text: preprocessText(buf.toString("utf-8"), f.name, f.source) });
@@ -217,7 +235,7 @@ export function prewarmSession(found: FoundConfig, sessionPath: string): Prewarm
     if (dirty) {
       db.transaction(() => {
         db.run("DELETE FROM cache_meta");
-        db.run("INSERT INTO cache_meta (key) VALUES (?)", [key]);
+        db.run("INSERT INTO cache_meta (key, scanned_ns) VALUES (?, ?)", [key, String(scannedNs)]);
         const del = db.prepare("DELETE FROM cache_files WHERE label = ?");
         for (const label of removed) del.run(label);
         const put = db.prepare("INSERT OR REPLACE INTO cache_files (label, source, path, mtime_ns, size, sha256) VALUES (?, ?, ?, ?, ?, ?)");
@@ -248,16 +266,16 @@ export function prewarmSession(found: FoundConfig, sessionPath: string): Prewarm
 }
 
 /** Copy the baseline to `sessionPath` and return its manifest, or null (and an empty session DB) on any miss. */
-function restoreBaseline(baseline: string, key: string, sessionPath: string): Map<string, ManifestRow> | null {
+function restoreBaseline(baseline: string, key: string, sessionPath: string): { rows: Map<string, ManifestRow>; scannedNs: bigint } | null {
   deleteDBFiles(sessionPath);
   try {
     copyFileSync(baseline, sessionPath);
     const db = new Database(sessionPath);
     try {
-      const meta = db.query("SELECT key FROM cache_meta").get() as { key: string } | null;
+      const meta = db.query("SELECT key, scanned_ns FROM cache_meta").get() as { key: string; scanned_ns: string } | null;
       if (meta?.key === key) {
         const rows = db.query("SELECT label, source, path, mtime_ns, size, sha256 FROM cache_files").all() as ManifestRow[];
-        return new Map(rows.map((r) => [r.label, r]));
+        return { rows: new Map(rows.map((r) => [r.label, r])), scannedNs: BigInt(meta.scanned_ns) };
       }
     } finally {
       db.close();
@@ -296,7 +314,7 @@ function writeBack(db: Database, baseline: string): string | undefined {
   try {
     mkdirSync(dir, { recursive: true });
     if (!existsSync(join(dir, ".gitignore"))) writeFileSync(join(dir, ".gitignore"), "*\n");
-    sweepDead(dir, /^baseline\.db\.(\d+)\.tmp$/);
+    sweepDead(dir, /^\w+\.db\.(\d+)\.tmp$/);
     try { unlinkSync(staging); } catch { /* absent */ }
     db.run("VACUUM INTO ?", [staging]);
     renameSync(staging, baseline);

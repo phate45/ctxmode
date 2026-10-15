@@ -2,7 +2,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
 import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { baselinePath, prewarmSession, sweepDead } from "../src/cache.ts";
 import { formatPrewarmManifest, parseConfig, type Config, type FoundConfig } from "../src/prewarm.ts";
@@ -88,7 +88,7 @@ describe("cold misses", () => {
   test("a corrupt baseline is a cold build and gets replaced", () => {
     const found = project({ "a.md": "# A\n\nalpha\n" });
     run(found).close();
-    writeFileSync(baselinePath(found.sourceBase), "not a database".repeat(500));
+    writeFileSync(baselinePath(found), "not a database".repeat(500));
     const r = run(found);
     expect(r.report.warm).toBe(false);
     expect(r.hits("alpha")).toEqual(["notes: a.md"]);
@@ -145,11 +145,11 @@ test("two concurrent write-backs leave a valid baseline", async () => {
   const procs = [spawn(), spawn()];
   expect(await Promise.all(procs.map((p) => p.exited))).toEqual([0, 0]);
 
-  const db = new Database(baselinePath(found.sourceBase), { readonly: true });
+  const db = new Database(baselinePath(found), { readonly: true });
   expect(db.query("PRAGMA integrity_check").get()).toEqual({ integrity_check: "ok" });
   expect(db.query("SELECT COUNT(*) AS n FROM cache_files").get()).toEqual({ n: 200 });
   db.close();
-  expect(readdirSync(join(found.sourceBase, ".ctxmode")).sort()).toEqual([".gitignore", "baseline.db"]);
+  expect(readdirSync(join(found.sourceBase, ".ctxmode")).sort()).toEqual([".gitignore", basename(baselinePath(found))]);
   const r = run(found);
   expect(counts(r)).toEqual({ warm: true, clean: 200, changed: 0, added: 0, removed: 0, refreshed: 0 });
   r.close();
@@ -193,4 +193,55 @@ describe("config parsing", () => {
       expect(() => parseConfig(raw, "c.json")).toThrow(/c\.json/);
     }
   });
+});
+
+test("two configs in one repo keep separate warm baselines", () => {
+  const a = project({ "a.md": "# A\n\nalpha\n" });
+  const b = { ...a, configPath: join(a.sourceBase, "other.json"), config: { sources: [{ label: "b", path: "notes", glob: "*.md" }] } };
+  for (const found of [a, b]) run(found).close();
+  for (const found of [a, b, a]) {
+    const r = run(found);
+    expect(r.report.warm).toBe(true);
+    r.close();
+  }
+});
+
+test("worktrees of one repo share the baseline, named by the config's path inside the checkout", () => {
+  const found = project({ "a.md": "# A\n\nalpha\n" });
+  const git = (...args: string[]) => Bun.spawnSync(["git", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: found.sourceBase });
+  git("init", "-q");
+  git("add", "-A");
+  git("commit", "-qm", "init");
+  const wt = join(found.sourceBase, "..", `${basename(found.sourceBase)}-wt`);
+  roots.push(wt);
+  expect(git("worktree", "add", "-q", wt).exitCode).toBe(0);
+  const inWorktree = { ...found, configPath: join(wt, "ctxmode.json"), sourceBase: wt };
+  expect(baselinePath(inWorktree)).toBe(baselinePath(found));
+  expect(baselinePath(found).startsWith(join(found.sourceBase, ".ctxmode") + "/")).toBe(true);
+  const elsewhere = { ...found, configPath: "/etc/ctxmode.json" };
+  expect(baselinePath(elsewhere)).not.toBe(baselinePath(found));
+});
+
+test("an edit that keeps size and mtime right after a scan is still picked up", () => {
+  const found = project({ "a.md": "# A\n\nalpha\n" });
+  const file = join(found.sourceBase, "notes", "a.md");
+  const mtime = new Date();
+  utimesSync(file, mtime, mtime);
+  run(found).close();
+  writeFileSync(file, "# A\n\nomega\n");
+  utimesSync(file, mtime, mtime);
+  const r = run(found);
+  expect(counts(r)).toEqual({ warm: true, clean: 0, changed: 1, added: 0, removed: 0, refreshed: 0 });
+  expect(r.hits("omega")).toEqual(["notes: a.md"]);
+  r.close();
+});
+
+test("editing a description keeps the baseline warm and updates the manifest", () => {
+  const found = project({ "a.md": "# A\n\nalpha\n" });
+  run(found).close();
+  found.config = { sources: [{ ...found.config.sources[0], description: "renamed notes" }] };
+  const r = run(found);
+  expect(r.report.warm).toBe(true);
+  expect(r.manifest).toContain("`notes` (1 file) — renamed notes");
+  r.close();
 });
