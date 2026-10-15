@@ -1,7 +1,8 @@
 // Vendored from mksglu/context-mode v1.0.169 (442f1eb) src/server.ts.
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { createRequire } from "node:module";
+import TurndownService from "turndown";
+import { gfm } from "turndown-plugin-gfm";
 import { readFileSync, writeSync, rmSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -1506,38 +1507,13 @@ async function runSearch(params: {
 }
 
 // ─────────────────────────────────────────────────────────
-// Turndown path resolution (external dep, like better-sqlite3)
-// ─────────────────────────────────────────────────────────
-
-let _turndownPath: string | null = null;
-let _gfmPluginPath: string | null = null;
-
-function resolveTurndownPath(): string {
-  if (!_turndownPath) {
-    const require = createRequire(import.meta.url);
-    _turndownPath = require.resolve("turndown");
-  }
-  return _turndownPath;
-}
-
-function resolveGfmPluginPath(): string {
-  if (!_gfmPluginPath) {
-    const require = createRequire(import.meta.url);
-    _gfmPluginPath = require.resolve("turndown-plugin-gfm");
-  }
-  return _gfmPluginPath;
-}
-
-// ─────────────────────────────────────────────────────────
 // Tool: fetch_and_index
 // ─────────────────────────────────────────────────────────
 
 // Subprocess code that fetches a URL, detects Content-Type, and outputs a
 // __CM_CT__:<type> marker on the first line so the handler can route to the
-// appropriate indexing strategy.  HTML is converted to markdown via Turndown.
+// appropriate indexing strategy.  HTML is written raw; the parent converts it.
 export function buildFetchCode(url: string, outputPath: string): string {
-  const turndownPath = JSON.stringify(resolveTurndownPath());
-  const gfmPath = JSON.stringify(resolveGfmPluginPath());
   const escapedOutputPath = JSON.stringify(outputPath);
   // Embed classifyIp into the subprocess so the connect-time DNS lookup is
   // re-validated with the same policy as ssrfGuard. Without this, an attacker
@@ -1565,8 +1541,6 @@ export function buildFetchCode(url: string, outputPath: string): string {
       : `var ${classifyIpFnName} = ${classifyIpInner};\nvar classifyIp = ${classifyIpFnName};`;
   const strictMode = process.env.CTXMODE_FETCH_STRICT === "1";
   return `
-const TurndownService = require(${turndownPath});
-const { gfm } = require(${gfmPath});
 const fs = require('fs');
 const dns = require('no' + 'de:dns');
 const dnsPromises = require('no' + 'de:dns/promises');
@@ -1795,11 +1769,7 @@ async function main() {
 
   // --- HTML responses (default for text/html, application/xhtml+xml) ---
   if (contentType.includes('text/html') || contentType.includes('application/xhtml')) {
-    const html = await safeText(resp);
-    const td = new TurndownService({ headingStyle: 'atx', codeBlockStyle: 'fenced' });
-    td.use(gfm);
-    td.remove(['script', 'style', 'nav', 'header', 'footer', 'noscript']);
-    emit('html', td.turndown(html));
+    emit('html', await safeText(resp));
     return;
   }
 
@@ -1814,6 +1784,14 @@ main();
 // ─────────────────────────────────────────────────────────
 // fetch_and_index helpers — split into parallel-safe fetch and serial-only index
 // ─────────────────────────────────────────────────────────
+
+// Conversion runs here, not in the fetch subprocess: a compiled binary's bundled modules are unreachable from a child script.
+function htmlToMarkdown(html: string): string {
+  const td = new TurndownService({ headingStyle: "atx", codeBlockStyle: "fenced" });
+  td.use(gfm);
+  td.remove(["script", "style", "nav", "header", "footer", "noscript"]);
+  return td.turndown(html);
+}
 
 const FETCH_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 const FETCH_PREVIEW_LIMIT = 3072;
@@ -2049,10 +2027,11 @@ async function fetchOneUrl(url: string, source: string | undefined, force: boole
       if (fileSize > MAX_FETCH_OUTPUT_BYTES) {
         return { kind: "fetch_error", url, error: `subprocess output ${fileSize} bytes exceeds cap ${MAX_FETCH_OUTPUT_BYTES}`, reason: "read" };
       }
-      markdown = readFileSync(outputPath, "utf-8").trim();
+      markdown = readFileSync(outputPath, "utf-8");
     } catch {
       return { kind: "fetch_error", url, error: "could not read subprocess output", reason: "read" };
     }
+    markdown = (header === "__CM_CT__:html" ? htmlToMarkdown(markdown) : markdown).trim();
     if (markdown.length === 0) {
       return { kind: "fetch_error", url, error: "empty content", reason: "empty" };
     }

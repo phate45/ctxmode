@@ -1,5 +1,6 @@
 // Entry point: subcommand dispatch; with no subcommand, serve MCP over stdio.
 import { argv, cwd, exit, stderr, stdout } from "node:process";
+import { version } from "../package.json";
 
 const [command = "serve"] = argv.slice(2);
 
@@ -12,6 +13,9 @@ switch (command) {
       stderr.write(`[ctxmode] Fatal: ${e.message}\n${e.stack}\n`);
       exit(1);
     }
+    break;
+  case "--version":
+    stdout.write(`ctxmode ${version} (${typeof CTXMODE_SHA === "string" ? CTXMODE_SHA : "dev"})\n`);
     break;
   case "hook":
     (await import("./hook.ts")).runHook();
@@ -41,6 +45,6 @@ switch (command) {
     exit(report.writeBackError ? 1 : 0);
   }
   default:
-    stderr.write(`unknown command: ${command}\nusage: ctxmode [serve|prewarm|hook]\n`);
+    stderr.write(`unknown command: ${command}\nusage: ctxmode [serve|prewarm|hook|--version]\n`);
     exit(2);
 }
