@@ -13,6 +13,9 @@ switch (command) {
       exit(1);
     }
     break;
+  case "hook":
+    (await import("./hook.ts")).runHook();
+    break;
   case "prewarm": {
     // Builds or refreshes the baseline for the config serve would load here.
     const { findConfig } = await import("./prewarm.ts");
@@ -38,6 +41,6 @@ switch (command) {
     exit(report.writeBackError ? 1 : 0);
   }
   default:
-    stderr.write(`unknown command: ${command}\nusage: main [serve|prewarm]\n`);
+    stderr.write(`unknown command: ${command}\nusage: ctxmode [serve|prewarm|hook]\n`);
     exit(2);
 }
