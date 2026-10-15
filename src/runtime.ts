@@ -1,7 +1,9 @@
 // Vendored from mksglu/context-mode v1.0.169 (442f1eb) src/runtime.ts.
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync } from "node:fs";
-import { JS_RUNTIMES } from "./adapters/types.js";
+
+/** Known JS runtime binary names (base filename without extension). */
+const JS_RUNTIMES: ReadonlySet<string> = new Set(["node", "bun", "deno"]);
 
 /**
  * Allowlist for SHELL env override. Only POSIX shells + Windows shells permit
@@ -42,15 +44,7 @@ export type Language =
   | "javascript"
   | "typescript"
   | "python"
-  | "shell"
-  | "ruby"
-  | "go"
-  | "rust"
-  | "php"
-  | "perl"
-  | "r"
-  | "elixir"
-  | "csharp";
+  | "shell";
 
 export interface RuntimeInfo {
   command: string;
@@ -64,14 +58,6 @@ export interface RuntimeMap {
   typescript: string | null;
   python: string | null;
   shell: string;
-  ruby: string | null;
-  go: string | null;
-  rust: string | null;
-  php: string | null;
-  perl: string | null;
-  r: string | null;
-  elixir: string | null;
-  csharp: string | null;
 }
 
 const isWindows = process.platform === "win32";
@@ -237,37 +223,6 @@ function resolveWindowsShell(windowsBash: string | null = resolveWindowsBash()):
           : "cmd.exe");
 }
 
-function getVersion(cmd: string, args: string[] = ["--version"]): string {
-  try {
-    // DEP0190 fix: avoid args array with shell:true on Windows.
-    if (process.platform === "win32") {
-      // Hardening (PR #537 review): quote any cmd.exe metacharacter, not just
-      // whitespace. Current arg sources are internally controlled, but cheap
-      // defense-in-depth for future call sites.
-      const cmdStr = [cmd, ...args]
-        .map(a => /[\s"&|<>^()%!]/.test(a) ? JSON.stringify(a) : a)
-        .join(" ");
-      return execSync(cmdStr, {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-        timeout: 5000,
-      })
-        .trim()
-        .split(/\r?\n/)[0];
-    } else {
-      return execFileSync(cmd, args, {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-        timeout: 5000,
-      })
-        .trim()
-        .split(/\r?\n/)[0];
-    }
-  } catch {
-    return "unknown";
-  }
-}
-
 /**
  * Resolve the JavaScript runtime used by PolyglotExecutor.
  *
@@ -377,18 +332,6 @@ export function detectRuntimes(): RuntimeMap {
     shell: shellOverride ?? (isWin
       ? resolveWindowsShell(windowsBash)
       : commandExists("bash") ? "bash" : "sh"),
-    ruby: commandExists("ruby") ? "ruby" : null,
-    go: commandExists("go") ? "go" : null,
-    rust: commandExists("rustc") ? "rustc" : null,
-    php: commandExists("php") ? "php" : null,
-    perl: commandExists("perl") ? "perl" : null,
-    r: commandExists("Rscript")
-      ? "Rscript"
-      : commandExists("r")
-        ? "r"
-        : null,
-    elixir: commandExists("elixir") ? "elixir" : null,
-    csharp: commandExists("dotnet-script") ? "dotnet-script" : null,
   };
 }
 
@@ -396,249 +339,10 @@ export function hasBunRuntime(): boolean {
   return bunExists();
 }
 
-/**
- * Resolved JS runtime for hook spawn commands. `path` is the absolute (or
- * bare-name on POSIX where PATH resolution is reliable) binary path.
- * `isBun` is true only when we successfully probed a Bun ≥1.0 install.
- */
-export interface HookRuntime {
-  readonly path: string;
-  readonly isBun: boolean;
-}
-
-/**
- * Cached result of {@link resolveHookRuntime}. Populated on first call so the
- * relatively expensive `bun --version` probe runs at most once per process.
- * Reset via {@link resetHookRuntimeCache} (test-only).
- */
-let _hookRuntimeCache: HookRuntime | null = null;
-
-/**
- * Reset the hook-runtime resolution cache. Test-only — production code
- * should never call this. Vitest mocks `node:child_process`/`node:fs`
- * per-test, so the per-process cache from a previous test would otherwise
- * mask the mock and yield the host's real bun/node detection result.
- */
-export function resetHookRuntimeCache(): void {
-  _hookRuntimeCache = null;
-}
-
-/**
- * Parse a `bun --version` stdout string and return true when the version is
- * ≥1.0.0. Anything that doesn't match `MAJOR.MINOR.PATCH` (with optional
- * pre-release suffix) returns false — we refuse to trust runtimes whose
- * version we can't read because the failure mode is silent miscompare
- * (e.g. a banner line getting interpreted as "0.0.0").
- */
-function bunVersionAtLeast1(versionOutput: string): boolean {
-  const trimmed = versionOutput.trim();
-  const m = /^(\d+)\.(\d+)\.(\d+)/.exec(trimmed);
-  if (!m) return false;
-  const major = Number(m[1]);
-  return Number.isFinite(major) && major >= 1;
-}
-
-/**
- * Resolve the JS runtime to use for spawning hook scripts (issue #738).
- *
- * Returns Bun when:
- *   - a bun binary is located via {@link bunCommand} (already handles the
- *     Windows .cmd shim trap from #506 + absolute path fallbacks), AND
- *   - `bun --version` exits 0 within the probe timeout, AND
- *   - the reported semver major is ≥1.
- *
- * Returns Node (`process.execPath`) on every other path — missing bun,
- * version probe failure, version <1, malformed version banner. Silent
- * fallback: never throws, never logs to stderr (a noisy log would clutter
- * the same MCP boot output that #719 tightened up).
- *
- * Result is cached at module load so the cost is amortised across every
- * hook command emission for the lifetime of the process. The cache also
- * keeps the behaviour deterministic — if the user `brew uninstall bun`
- * mid-session, the cached resolution stays valid for that session and the
- * next MCP boot re-detects.
- *
- * Why bun ≥1.0 instead of "any bun":
- *   - Bun 0.x had multiple ESM/module-resolution regressions that broke
- *     dynamic `import()` inside hooks (and our hooks do ~7 dynamic imports
- *     in `pretooluse.mjs`).
- *   - 1.0 ships stable npm-compat that our better-sqlite3-adjacent code
- *     relies on indirectly (hooks share `ensure-deps.mjs` which is
- *     bun-safe past 1.0 but not 0.x).
- *
- * NOT used by:
- *   - `buildNodeCommand` — kept on `process.execPath` for openclaw doctor /
- *     upgrade hints which must invoke the better-sqlite3-loading CLI on
- *     Node (#543: bun cannot dlopen better-sqlite3's prebuilt .node).
- *   - `ensure-deps.mjs` — separate path, must stay on Node for the same
- *     reason.
- *   - `ctx_upgrade` — separate path, must stay on Node for the same reason.
- */
-/**
- * Liveness-guarded Node path for the hook-runtime fallback (issue #841).
- *
- * `process.execPath` is pinned into every baked hook command because PATH
- * resolution is unreliable for hooks (#190 snap-Node re-invokes the wrapper;
- * #369 Windows Git Bash / MSYS can't resolve a bare `node`). But under a
- * version manager (mise / asdf / nvm) execPath is a *version-pinned* absolute
- * path — e.g. `~/.local/share/mise/installs/node/20.1.0/bin/node`. A routine
- * `mise upgrade node` installs the next patch and DELETES the 20.1.0 dir, so
- * the cached path dangles and every hook spawn fails with ENOENT — silently
- * killing context-mode for that user.
- *
- * Same liveness-guard shape as the #800/#803 fix in
- * {@link resolveJavascriptRuntime}: use the pinned execPath IFF it still
- * exists on disk (preserving the #190/#369 reasons it was pinned), otherwise
- * re-resolve a working `node` from PATH. The version manager's shim dir is on
- * PATH and always points at the current patch, so bare `node` heals the host
- * without a re-install. Falls back to the (stale) execPath only when no PATH
- * node is reachable either — a strictly-better last resort than a dangling
- * versioned path, and the doctor/upgrade flows surface the actionable error.
- */
-function liveNodeRuntime(): HookRuntime {
-  if (existsSync(process.execPath)) {
-    return { path: process.execPath, isBun: false };
-  }
-  if (commandExists("node")) {
-    return { path: "node", isBun: false };
-  }
-  return { path: process.execPath, isBun: false };
-}
-
-export function resolveHookRuntime(): HookRuntime {
-  if (_hookRuntimeCache) return _hookRuntimeCache;
-  const nodeFallback: HookRuntime = liveNodeRuntime();
-  try {
-    if (!bunExists()) {
-      _hookRuntimeCache = nodeFallback;
-      return _hookRuntimeCache;
-    }
-    const bun = bunCommand();
-    // Re-use the same probe shape as getVersion (POSIX execFile, Windows
-    // execSync quoted string for DEP0190 compliance).
-    let versionOutput: string;
-    try {
-      if (process.platform === "win32") {
-        const out = execSync(`"${bun}" --version`, {
-          encoding: "utf-8",
-          stdio: ["pipe", "pipe", "pipe"],
-          timeout: 5000,
-        });
-        versionOutput = String(out);
-      } else {
-        const out = execFileSync(bun, ["--version"], {
-          encoding: "utf-8",
-          stdio: ["pipe", "pipe", "pipe"],
-          timeout: 5000,
-        });
-        versionOutput = String(out);
-      }
-    } catch {
-      _hookRuntimeCache = nodeFallback;
-      return _hookRuntimeCache;
-    }
-    if (!bunVersionAtLeast1(versionOutput)) {
-      _hookRuntimeCache = nodeFallback;
-      return _hookRuntimeCache;
-    }
-    _hookRuntimeCache = { path: bun, isBun: true };
-    return _hookRuntimeCache;
-  } catch {
-    _hookRuntimeCache = nodeFallback;
-    return _hookRuntimeCache;
-  }
-}
-
-export function getRuntimeSummary(runtimes: RuntimeMap): string {
-  const lines: string[] = [];
-  const bunPreferred = runtimes.javascript?.endsWith("bun") ?? false;
-
-  if (runtimes.javascript) {
-    lines.push(
-      `  JavaScript: ${runtimes.javascript} (${getVersion(runtimes.javascript)})${bunPreferred ? " ⚡" : ""}`,
-    );
-  } else {
-    // #731: host binary (opencode/kilo) AND no PATH-resolvable node.
-    // Surface actionable guidance instead of rendering literal `null`.
-    lines.push(
-      `  JavaScript: not available (install node or bun — host process is not a JS runtime)`,
-    );
-  }
-
-  if (runtimes.typescript) {
-    lines.push(
-      `  TypeScript: ${runtimes.typescript} (${getVersion(runtimes.typescript)})`,
-    );
-  } else {
-    lines.push(
-      `  TypeScript: not available (install bun, tsx, or ts-node)`,
-    );
-  }
-
-  if (runtimes.python) {
-    lines.push(
-      `  Python:     ${runtimes.python} (${getVersion(runtimes.python)})`,
-    );
-  } else {
-    lines.push(`  Python:     not available`);
-  }
-
-  lines.push(
-    `  Shell:      ${runtimes.shell} (${getVersion(runtimes.shell)})`,
-  );
-
-  // Optional runtimes — only show if available
-  if (runtimes.ruby)
-    lines.push(
-      `  Ruby:       ${runtimes.ruby} (${getVersion(runtimes.ruby)})`,
-    );
-  if (runtimes.go)
-    lines.push(`  Go:         ${runtimes.go} (${getVersion(runtimes.go, ["version"])})`);
-  if (runtimes.rust)
-    lines.push(
-      `  Rust:       ${runtimes.rust} (${getVersion(runtimes.rust)})`,
-    );
-  if (runtimes.php)
-    lines.push(
-      `  PHP:        ${runtimes.php} (${getVersion(runtimes.php)})`,
-    );
-  if (runtimes.perl)
-    lines.push(
-      `  Perl:       ${runtimes.perl} (${getVersion(runtimes.perl)})`,
-    );
-  if (runtimes.r)
-    lines.push(`  R:          ${runtimes.r} (${getVersion(runtimes.r)})`);
-  if (runtimes.elixir)
-    lines.push(
-      `  Elixir:     ${runtimes.elixir} (${getVersion(runtimes.elixir)})`,
-    );
-  if (runtimes.csharp)
-    lines.push(
-      `  C#:         ${runtimes.csharp} (${getVersion(runtimes.csharp)})`,
-    );
-
-  if (!bunPreferred) {
-    lines.push("");
-    lines.push(
-      "  Tip: Install Bun for 3-5x faster JS/TS execution → https://bun.sh",
-    );
-  }
-
-  return lines.join("\n");
-}
-
 export function getAvailableLanguages(runtimes: RuntimeMap): Language[] {
   const langs: Language[] = ["javascript", "shell"];
   if (runtimes.typescript) langs.push("typescript");
   if (runtimes.python) langs.push("python");
-  if (runtimes.ruby) langs.push("ruby");
-  if (runtimes.go) langs.push("go");
-  if (runtimes.rust) langs.push("rust");
-  if (runtimes.php) langs.push("php");
-  if (runtimes.perl) langs.push("perl");
-  if (runtimes.r) langs.push("r");
-  if (runtimes.elixir) langs.push("elixir");
-  if (runtimes.csharp) langs.push("csharp");
   return langs;
 }
 
@@ -708,59 +412,5 @@ export function buildCommand(
       }
       return [runtimes.shell, filePath];
     }
-
-    case "ruby":
-      if (!runtimes.ruby) {
-        throw new Error("Ruby not available. Install ruby.");
-      }
-      return [runtimes.ruby, filePath];
-
-    case "go":
-      if (!runtimes.go) {
-        throw new Error("Go not available. Install go.");
-      }
-      return ["go", "run", filePath];
-
-    case "rust": {
-      if (!runtimes.rust) {
-        throw new Error(
-          "Rust not available. Install rustc via https://rustup.rs",
-        );
-      }
-      // Rust needs compile + run — handled specially in executor
-      return ["__rust_compile_run__", filePath];
-    }
-
-    case "php":
-      if (!runtimes.php) {
-        throw new Error("PHP not available. Install php.");
-      }
-      return ["php", filePath];
-
-    case "perl":
-      if (!runtimes.perl) {
-        throw new Error("Perl not available. Install perl.");
-      }
-      return ["perl", filePath];
-
-    case "r":
-      if (!runtimes.r) {
-        throw new Error("R not available. Install R / Rscript.");
-      }
-      return [runtimes.r, filePath];
-
-    case "elixir":
-      if (!runtimes.elixir) {
-        throw new Error( "Elixir not available. Install elixir.");
-      }
-      return ["elixir", filePath];
-
-    case "csharp":
-      if (!runtimes.csharp) {
-        throw new Error(
-          "C# not available. Install dotnet-script via `dotnet tool install -g dotnet-script`.",
-        );
-      }
-      return [runtimes.csharp, filePath];
   }
 }

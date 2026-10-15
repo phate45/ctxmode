@@ -26,14 +26,6 @@ const SCRIPT_EXT: Record<Language, string> = {
   typescript: "ts",
   python: "py",
   shell: "sh",
-  ruby: "rb",
-  go: "go",
-  rust: "rs",
-  php: "php",
-  perl: "pl",
-  r: "R",
-  elixir: "exs",
-  csharp: "csx",
 };
 
 /** Pure helper — exported for unit testing. Returns "script" or "script.<ext>". */
@@ -288,11 +280,6 @@ export class PolyglotExecutor {
       const filePath = this.#writeScript(tmpDir, code, language);
       const cmd = buildCommand(this.#runtimes, language, filePath);
 
-      // Rust: compile then run
-      if (cmd[0] === "__rust_compile_run__") {
-        return await this.#compileAndRun(filePath, tmpDir, timeout);
-      }
-
       // Every language runs in the project directory so git, relative paths,
       // and other project-aware tools resolve naturally. The script FILE lives
       // in the sandbox tmpDir and is passed to the runtime by absolute path
@@ -331,22 +318,6 @@ export class PolyglotExecutor {
   }
 
   #writeScript(tmpDir: string, code: string, language: Language): string {
-    // Go needs a main package wrapper if not present
-    if (language === "go" && !code.includes("package ")) {
-      code = `package main\n\nimport "fmt"\n\nfunc main() {\n${code}\n}\n`;
-    }
-
-    // PHP needs opening tag if not present
-    if (language === "php" && !code.trimStart().startsWith("<?")) {
-      code = `<?php\n${code}`;
-    }
-
-    // Elixir: prepend compiled BEAM paths when inside a Mix project
-    if (language === "elixir" && existsSync(join(this.#projectRoot, "mix.exs"))) {
-      const escaped = JSON.stringify(join(this.#projectRoot, "_build/dev/lib"));
-      code = `Path.wildcard(Path.join(${escaped}, "*/ebin"))\n|> Enum.each(&Code.prepend_path/1)\n\n${code}`;
-    }
-
     const fp = join(
       tmpDir,
       buildScriptFilename(
@@ -375,38 +346,6 @@ export class PolyglotExecutor {
     return fp;
   }
 
-  async #compileAndRun(
-    srcPath: string,
-    cwd: string,
-    timeout: number | undefined,
-  ): Promise<ExecResult> {
-    const binSuffix = isWin ? ".exe" : "";
-    const binPath = srcPath.replace(/\.rs$/, "") + binSuffix;
-
-    // Compile — cap rustc invocation at 60s when caller didn't bound the
-    // overall timeout (a hung compile shouldn't run forever even if the
-    // caller is fine with a long-running binary afterwards).
-    try {
-      execFileSync("rustc", [srcPath, "-o", binPath], {
-        cwd,
-        timeout: timeout === undefined ? 60_000 : Math.min(timeout, 60_000),
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (err: unknown) {
-      const message = err instanceof Error ? (err as any).stderr || err.message : String(err);
-      return {
-        stdout: "",
-        stderr: `Compilation failed:\n${message}`,
-        exitCode: 1,
-        timedOut: false,
-      };
-    }
-
-    // Run
-    return this.#spawn([binPath], cwd, cwd, timeout);
-  }
-
   async #spawn(
     cmd: string[],
     cwd: string,
@@ -421,7 +360,7 @@ export class PolyglotExecutor {
       // .exe paths now (#506), but if it falls back to the bare "bun" string
       // on Windows that resolution typically goes through a `bun.cmd` shim
       // (npm i -g bun) which CreateProcess can't execute without cmd.exe.
-      const needsShell = isWin && ["tsx", "ts-node", "elixir", "bun", "dotnet-script"].includes(cmd[0]);
+      const needsShell = isWin && ["tsx", "ts-node", "bun"].includes(cmd[0]);
 
       // On Windows with Git Bash, pass the script as `bash -c "source /posix/path"`
       // rather than `bash /path/to/script.sh`. This avoids MSYS2 path mangling
@@ -762,25 +701,6 @@ export class PolyglotExecutor {
         const sq = "'" + absolutePath.replace(/'/g, "'\\''") + "'";
         return `FILE_CONTENT_PATH=${sq}\nfile_path=${sq}\nFILE_CONTENT=$(cat ${sq})\n${code}`;
       }
-      case "ruby":
-        return `FILE_CONTENT_PATH = ${escaped}\nfile_path = FILE_CONTENT_PATH\nFILE_CONTENT = File.read(FILE_CONTENT_PATH, encoding: "utf-8")\n${code}`;
-      case "go":
-        return `package main\n\nimport (\n\t"fmt"\n\t"os"\n)\n\nvar FILE_CONTENT_PATH = ${escaped}\nvar file_path = FILE_CONTENT_PATH\n\nfunc main() {\n\tb, _ := os.ReadFile(FILE_CONTENT_PATH)\n\tFILE_CONTENT := string(b)\n\t_ = FILE_CONTENT\n\t_ = fmt.Sprint()\n${code}\n}\n`;
-      case "rust":
-        return `#![allow(unused_variables)]\nuse std::fs;\n\nfn main() {\n    let file_content_path = ${escaped};\n    let file_path = file_content_path;\n    let file_content = fs::read_to_string(file_content_path).unwrap();\n${code}\n}\n`;
-      case "php":
-        return `<?php\n$FILE_CONTENT_PATH = ${escaped};\n$file_path = $FILE_CONTENT_PATH;\n$FILE_CONTENT = file_get_contents($FILE_CONTENT_PATH);\n${code}`;
-      case "perl":
-        return `my $FILE_CONTENT_PATH = ${escaped};\nmy $file_path = $FILE_CONTENT_PATH;\nopen(my $fh, '<:encoding(UTF-8)', $FILE_CONTENT_PATH) or die "Cannot open: $!";\nmy $FILE_CONTENT = do { local $/; <$fh> };\nclose($fh);\n${code}`;
-      case "r":
-        return `FILE_CONTENT_PATH <- ${escaped}\nfile_path <- FILE_CONTENT_PATH\nFILE_CONTENT <- readLines(FILE_CONTENT_PATH, warn=FALSE, encoding="UTF-8")\nFILE_CONTENT <- paste(FILE_CONTENT, collapse="\\n")\n${code}`;
-      case "elixir":
-        return `file_content_path = ${escaped}\nfile_path = file_content_path\nfile_content = File.read!(file_content_path)\n${code}`;
-      case "csharp":
-        // .csx forbids `using` directives after any other top-level statement
-        // (CS1529). User code inside executeFile must use fully-qualified type
-        // names (e.g. `System.Text.Json.JsonDocument`) instead of `using`.
-        return `var FILE_CONTENT_PATH = ${escaped};\nvar file_path = FILE_CONTENT_PATH;\nvar FILE_CONTENT = System.IO.File.ReadAllText(FILE_CONTENT_PATH);\n${code}`;
     }
   }
 }

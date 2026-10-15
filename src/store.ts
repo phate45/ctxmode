@@ -12,11 +12,10 @@
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { loadDatabase, applyWALPragmas, closeDB, cleanOrphanedWALFiles, withRetry, deleteDBFiles, isSQLiteCorruptionError } from "./db-base.js";
 import type { PreparedStatement } from "./db-base.js";
-import { readFileSync, readdirSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
+import { readFileSync, unlinkSync, existsSync, statSync, openSync, fstatSync, closeSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { walkDirectoryDetailed, type WalkOptions } from "./store-directory.js";
 
 // ─────────────────────────────────────────────────────────
 // Types
@@ -173,93 +172,6 @@ const WHITESPACE_BREAK_RATIO = 0.5;
 // ─────────────────────────────────────────────────────────
 // ContentStore
 // ─────────────────────────────────────────────────────────
-
-/**
- * Remove stale DB files from previous sessions whose processes no longer exist.
- */
-export function cleanupStaleDBs(): number {
-  const dir = tmpdir();
-  let cleaned = 0;
-  try {
-    const files = readdirSync(dir);
-    for (const file of files) {
-      const match = file.match(/^context-mode-(\d+)\.db$/);
-      if (!match) continue;
-      const pid = parseInt(match[1], 10);
-      if (pid === process.pid) continue;
-      try {
-        process.kill(pid, 0);
-      } catch {
-        const base = join(dir, file);
-        for (const suffix of ["", "-wal", "-shm"]) {
-          try { unlinkSync(base + suffix); } catch { /* ignore */ }
-        }
-        cleaned++;
-      }
-    }
-  } catch { /* ignore readdir errors */ }
-  return cleaned;
-}
-
-/**
- * Check if a PID is still alive (not a zombie holding a WAL lock).
- * Returns true if the process exists, false if it's dead.
- */
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Clean up stale per-project content store DBs older than maxAgeDays.
- * Scans the given directory for *.db files and checks mtime.
- * Also detects zombie processes holding WAL locks — if a WAL file exists
- * but the owning PID is dead, the DB files are cleaned up regardless of age.
- */
-export function cleanupStaleContentDBs(contentDir: string, maxAgeDays: number): number {
-  let cleaned = 0;
-  try {
-    if (!existsSync(contentDir)) return 0;
-    const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000;
-    const files = readdirSync(contentDir).filter(f => f.endsWith(".db"));
-    for (const file of files) {
-      try {
-        const filePath = join(contentDir, file);
-        const mtime = statSync(filePath).mtimeMs;
-        let shouldClean = mtime < cutoff;
-
-        // Detect zombie processes holding WAL locks:
-        // If a WAL file exists, try to read the WAL header to extract the PID.
-        // WAL files from dead processes can block new connections.
-        if (!shouldClean) {
-          const walPath = filePath + "-wal";
-          if (existsSync(walPath)) {
-            try {
-              const walStat = statSync(walPath);
-              // If WAL file is non-empty and DB hasn't been modified in >1 hour,
-              // the owning process may be dead — check via mtime staleness
-              if (walStat.size > 0 && (Date.now() - walStat.mtimeMs) > 3600_000) {
-                shouldClean = true;
-              }
-            } catch { /* ignore WAL check errors */ }
-          }
-        }
-
-        if (shouldClean) {
-          for (const suffix of ["", "-wal", "-shm"]) {
-            try { unlinkSync(filePath + suffix); } catch { /* ignore */ }
-          }
-          cleaned++;
-        }
-      } catch { /* ignore per-file errors */ }
-    }
-  } catch { /* ignore readdir errors */ }
-  return cleaned;
-}
 
 // ── Proximity helpers (pure functions) ──
 
@@ -891,70 +803,6 @@ export class ContentStore {
     const contentHash = filePath ? createHash("sha256").update(text).digest("hex") : undefined;
 
     return withRetry(() => this.#insertChunks(chunks, label, text, filePath, contentHash, attribution));
-  }
-
-  // ── Index Directory (#687) ──
-
-  /**
-   * Index every file under a directory by walking it with `walkDirectory` and
-   * delegating each discovered file to `this.index({ path })`. The per-file
-   * `openSync + fstatSync.isFile()` security gate at line ~845 stays active
-   * for every file — directory support never bypasses the TOCTOU defense
-   * from #442 round-3.
-   *
-   * Reported by @matiasduartee in #687.
-   */
-  indexDirectory(opts: {
-    path: string;
-    source?: string;
-    attribution?: { sessionId?: string; eventId?: string };
-    /** Optional per-file deny check — runs INSIDE the walk loop so a denied
-     *  file does not even open a fd. Returns true to deny. */
-    perFileDeny?: (absPath: string) => boolean;
-  } & WalkOptions): {
-    filesIndexed: number;
-    totalChunks: number;
-    capped: boolean;
-    totalSeen: number;
-    denied: number;
-    failed: number;
-    label: string;
-  } {
-    const { path: rootPath, source, attribution, perFileDeny, ...walkOpts } = opts;
-    const walked = walkDirectoryDetailed(rootPath, walkOpts);
-
-    let filesIndexed = 0;
-    let totalChunks = 0;
-    let denied = 0;
-    let failed = 0;
-
-    for (const file of walked.files) {
-      if (perFileDeny && perFileDeny(file)) {
-        denied++;
-        continue;
-      }
-      try {
-        // Per-file source label so ctx_search(source: "<file>") still works.
-        const fileSource = source ? `${source}:${file}` : file;
-        const r = this.index({ path: file, source: fileSource, attribution });
-        filesIndexed++;
-        totalChunks += r.totalChunks;
-      } catch {
-        // Per-file failure (e.g. fd-bound fstat rejection of a non-regular
-        // file that races between walk and read) — count + continue.
-        failed++;
-      }
-    }
-
-    return {
-      filesIndexed,
-      totalChunks,
-      capped: walked.capped,
-      totalSeen: walked.totalSeen,
-      denied,
-      failed,
-      label: source ?? rootPath,
-    };
   }
 
   // ── Index Plain Text ──

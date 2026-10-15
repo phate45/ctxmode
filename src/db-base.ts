@@ -3,16 +3,13 @@
  * db-base — Reusable SQLite infrastructure for context-mode packages.
  *
  * Provides lazy-loading of better-sqlite3, WAL pragma setup, prepared
- * statement caching interface, and DB file cleanup helpers. Both
- * ContentStore and SessionDB build on top of these primitives.
+ * statement caching interface, and DB file cleanup helpers for ContentStore.
  */
 
 import type DatabaseConstructor from "better-sqlite3";
 import type { Database as DatabaseInstance } from "better-sqlite3";
 import { createRequire } from "node:module";
-import { existsSync, unlinkSync, renameSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { existsSync, unlinkSync } from "node:fs";
 // v1.0.130 — `acquireDbLock` + `locking_mode = EXCLUSIVE` were REMOVED.
 // See docs/adr/0001-sessiondb-multi-writer.md for the architectural
 // rationale. The short version: SessionDB is multi-writer-safe and the
@@ -407,19 +404,6 @@ export function closeDB(db: DatabaseInstance): void {
 }
 
 // ─────────────────────────────────────────────────────────
-// Default path helper
-// ─────────────────────────────────────────────────────────
-
-/**
- * Return the default per-process DB path for context-mode databases.
- * Uses the OS temp directory and embeds the current PID so multiple
- * server instances never share a file.
- */
-export function defaultDBPath(prefix: string = "context-mode"): string {
-  return join(tmpdir(), `${prefix}-${process.pid}.db`);
-}
-
-// ─────────────────────────────────────────────────────────
 // Retry helper
 // ─────────────────────────────────────────────────────────
 
@@ -469,150 +453,4 @@ export function isSQLiteCorruptionError(msg: string): boolean {
     msg.includes("database disk image is malformed") ||
     msg.includes("file is not a database")
   );
-}
-
-/**
- * Rename a corrupt DB and its WAL/SHM files so a fresh DB can be created.
- * Best-effort — individual rename failures are silently ignored.
- */
-export function renameCorruptDB(dbPath: string): void {
-  const ts = Date.now();
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try {
-      renameSync(dbPath + suffix, `${dbPath}${suffix}.corrupt-${ts}`);
-    } catch { /* file may not exist */ }
-  }
-}
-
-// ─────────────────────────────────────────────────────────
-// Base class
-// ─────────────────────────────────────────────────────────
-
-/**
- * SQLiteBase — minimal base class that handles open/close/cleanup lifecycle.
- *
- * Subclasses call `super(dbPath)` to open the database with WAL pragmas
- * applied, then implement `initSchema()` and `prepareStatements()`.
- *
- * The `db` getter exposes the raw `DatabaseInstance` to subclasses only.
- */
-/**
- * Track all live DatabaseInstance objects so we can close them on process exit.
- * Prevents better-sqlite3 segfaults caused by V8 garbage-collecting Database
- * objects after the native addon context is already torn down.
- *
- * Uses a global symbol so the set and exit handler survive vitest's module
- * re-imports within the same fork process (ESM isolate mode clears
- * module-level state but globalThis persists).
- */
-// v1.0.130 — symbol name bumped because the value type reverted from
-// Map<DatabaseInstance, string> (v1.0.128 lockfile pairing) back to
-// Set<DatabaseInstance>. A persistent global slot from a v1.0.128 or
-// v1.0.129 module would deserialize as the wrong shape and crash the
-// exit hook iteration.
-const _kLiveDBs = Symbol.for("__context_mode_live_dbs_v3__");
-const _liveDBs: Set<DatabaseInstance> = (() => {
-  const g = globalThis as Record<symbol, Set<DatabaseInstance> | undefined>;
-  if (!g[_kLiveDBs]) {
-    g[_kLiveDBs] = new Set<DatabaseInstance>();
-    process.on("exit", () => {
-      for (const db of g[_kLiveDBs]!) {
-        closeDB(db);
-      }
-      g[_kLiveDBs]!.clear();
-    });
-  }
-  return g[_kLiveDBs]!;
-})();
-
-export abstract class SQLiteBase {
-  readonly #dbPath: string;
-  readonly #db: DatabaseInstance;
-
-  /**
-   * Open (or create) a SQLite DB at `dbPath`.
-   *
-   * v1.0.130 — multi-writer is the contract. ALL SQLiteBase consumers
-   * (SessionDB, ContentStore) may open the same on-disk dbPath from
-   * multiple processes simultaneously — that is the legitimate multi-
-   * window UX shape and the WAL handles it natively. SQLITE_BUSY on
-   * write contention is absorbed by `withRetry()` below (busy_timeout
-   * = 30000ms inside `new Database(...)`).
-   *
-   * v1.0.128 introduced a single-writer guard here as a defense against
-   * #560. That defense was an over-correction — the actual root causes
-   * of #560 were #559 (zombie MCP child accumulation) and #561 (Pi
-   * misdetection writing to the wrong DB path), both fixed in v1.0.128
-   * + v1.0.129. The single-writer guard broke legitimate multi-window
-   * users; v1.0.130 rolls it out. See
-   * docs/adr/0001-sessiondb-multi-writer.md and the v1.0.130 INVARIANT
-   * block in tests/util/db-base-platform-gate.test.ts for the
-   * regression-proof anchor (source-pin + behavioural).
-   */
-  constructor(dbPath: string) {
-    const Database = loadDatabase();
-    this.#dbPath = dbPath;
-    cleanOrphanedWALFiles(dbPath);
-    let db: DatabaseInstance;
-    try {
-      db = new Database(dbPath, { timeout: 30000 });
-      applyWALPragmas(db);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (isSQLiteCorruptionError(msg)) {
-        renameCorruptDB(dbPath);
-        cleanOrphanedWALFiles(dbPath);
-        try {
-          db = new Database(dbPath, { timeout: 30000 });
-          applyWALPragmas(db);
-        } catch (retryErr) {
-          throw new Error(
-            `Failed to create fresh DB after renaming corrupt file: ${retryErr instanceof Error ? retryErr.message : String(retryErr)}`
-          );
-        }
-      } else {
-        throw err;
-      }
-    }
-    this.#db = db;
-    _liveDBs.add(this.#db);
-    this.initSchema();
-    this.prepareStatements();
-  }
-
-  /** Called once after WAL pragmas are applied. Subclasses run CREATE TABLE/VIRTUAL TABLE here. */
-  protected abstract initSchema(): void;
-
-  /** Called once after schema init. Subclasses compile and cache their prepared statements here. */
-  protected abstract prepareStatements(): void;
-
-  /** Raw database instance — available to subclasses only. */
-  protected get db(): DatabaseInstance {
-    return this.#db;
-  }
-
-  /** The path this database was opened from. */
-  get dbPath(): string {
-    return this.#dbPath;
-  }
-
-  /** Close the database connection without deleting files. */
-  close(): void {
-    _liveDBs.delete(this.#db);
-    closeDB(this.#db);
-  }
-
-  protected withRetry<T>(fn: () => T): T {
-    return withRetry(fn);
-  }
-
-  /**
-   * Close the connection and delete all associated DB files (main, WAL, SHM).
-   * Call on process exit or at end of session lifecycle.
-   */
-  cleanup(): void {
-    _liveDBs.delete(this.#db);
-    closeDB(this.#db);
-    deleteDBFiles(this.#dbPath);
-  }
 }

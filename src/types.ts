@@ -2,50 +2,9 @@
 /**
  * types — Shared type definitions for context-mode packages.
  *
- * Contains interfaces that are genuinely shared between the core (ContentStore,
- * PolyglotExecutor) and the session domain (SessionDB, event extraction).
+ * Contains interfaces shared by ContentStore and PolyglotExecutor.
  * Import from "./types.js".
  */
-
-// ─────────────────────────────────────────────────────────
-// Session event types
-// ─────────────────────────────────────────────────────────
-
-/** Tool call representation used during event extraction from Claude messages. */
-export interface ToolCall {
-  toolName: string;
-  toolInput: Record<string, unknown>;
-  toolResponse?: string;
-  isError?: boolean;
-}
-
-/** User message representation used during event extraction. */
-export interface UserMessage {
-  content: string;
-  timestamp?: string;
-}
-
-/**
- * Session event as stored in SessionDB.
- * Each event captures a discrete unit of session activity (tool use, user
- * message, assistant response summary, etc.) for later resume-snapshot
- * reconstruction.
- */
-export interface SessionEvent {
-  type: string;
-  category: string;
-  data: string;
-  priority: number;
-  data_hash: string;
-  /**
-   * Best-effort project attribution for this event.
-   * Empty string means unattributed/unknown.
-   */
-  project_dir?: string;
-  attribution_source?: string;
-  /** 0..1 confidence score for project attribution. */
-  attribution_confidence?: number;
-}
 
 // ─────────────────────────────────────────────────────────
 // Execution result
@@ -111,38 +70,3 @@ export interface StoreStats {
   chunks: number;
   codeChunks: number;
 }
-
-// ─────────────────────────────────────────────────────────
-// Resume snapshot
-// ─────────────────────────────────────────────────────────
-
-/**
- * Structured representation of a session resume snapshot, suitable for
- * injecting into a new conversation as context. Generated from stored
- * SessionEvents by the snapshot builder.
- */
-export interface ResumeSnapshot {
-  /** ISO-8601 timestamp of when the snapshot was generated. */
-  generatedAt: string;
-  /** Human-readable summary of the session to this point. */
-  summary: string;
-  /** Ordered list of events selected for the snapshot (priority-filtered). */
-  events: SessionEvent[];
-}
-
-// ─────────────────────────────────────────────────────────
-// Priority constants
-// ─────────────────────────────────────────────────────────
-
-/**
- * Priority levels for SessionEvent records. Higher numbers are more important
- * and are retained when the snapshot budget is tight.
- */
-export const EventPriority = {
-  LOW: 1,
-  NORMAL: 2,
-  HIGH: 3,
-  CRITICAL: 4,
-} as const;
-
-export type EventPriorityLevel = (typeof EventPriority)[keyof typeof EventPriority];
