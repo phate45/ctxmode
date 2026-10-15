@@ -12,7 +12,9 @@
     "bump": "tsx scripts/bump.ts",
     "test:filters": "tsx scripts/output-filter-smoke.ts",
     "test:e2e": "tsx scripts/e2e-smoke.ts",
-    "test": "bun run test:filters && bun run test:e2e"
+    "test": "bun run test:filters && bun run test:e2e && bun run test:golden",
+    "test:golden": "bun test/golden/run.ts --check -- node wrapper.bundle.mjs",
+    "parity:rank": "bun scripts/parity-rank.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
